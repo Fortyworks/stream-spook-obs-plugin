@@ -1,0 +1,89 @@
+// StreamSpook for OBS
+// Copyright (C) 2026 Fortyworks
+// SPDX-License-Identifier: GPL-2.0-or-later
+// This file is part of a GPL-2.0-or-later program; see LICENSE.
+
+// モザイク。
+//
+// ブロックの中心 1 点を Point サンプリングで拾って塗りつぶす。
+// 範囲（region）は対象のピクセル座標で受け取り、四角か楕円のマスクを
+// 作って元の絵と混ぜる。
+
+uniform float4x4 ViewProj;
+uniform texture2d image;
+
+uniform float2 uv_size;        // 対象の大きさ（px）
+uniform float block_size;      // ブロックの大きさ（px、アニメーション済み）
+uniform bool region_enabled;   // 一部にだけ掛ける
+uniform float4 region;         // x, y, w, h（px）
+uniform float region_shape;    // 0 四角 / 1 楕円
+uniform float region_feather;  // ふちのぼかし（px）
+uniform bool region_invert;    // 範囲の外に掛ける
+
+sampler_state textureSampler {
+	Filter    = Linear;
+	AddressU  = Clamp;
+	AddressV  = Clamp;
+};
+
+sampler_state pointSampler {
+	Filter    = Point;
+	AddressU  = Clamp;
+	AddressV  = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData vert_out;
+	vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv  = v_in.uv;
+	return vert_out;
+}
+
+// 範囲の中で 1、外で 0。ふちは feather ぶんだけ内側へ向かって薄くなる
+float region_mask(float2 px)
+{
+	float2 hs = max(region.zw * 0.5, 0.5);
+	float2 rel = px - (region.xy + region.zw * 0.5);
+	float f = max(region_feather, 0.01);
+	float m;
+	if (region_shape > 0.5) {
+		float r = length(rel / hs);
+		float fe = f / max(min(hs.x, hs.y), 1.0);
+		m = 1.0 - smoothstep(1.0 - fe, 1.0, r);
+	} else {
+		float2 d = abs(rel) - hs;
+		float dm = max(d.x, d.y);
+		m = 1.0 - smoothstep(-f, 0.0, dm);
+	}
+	return region_invert ? 1.0 - m : m;
+}
+
+float4 PSMosaic(VertData v_in) : TARGET
+{
+	float2 px = v_in.uv * uv_size;
+	float bs = max(block_size, 1.0);
+
+	// ブロックの中心を拾う。端の欠けたブロックは画像の外を指すので、内側に留める
+	float2 cellc = (floor(px / bs) + 0.5) * bs;
+	cellc = min(cellc, uv_size - 0.5);
+	float4 mosaic = image.Sample(pointSampler, cellc / uv_size);
+
+	float m = region_enabled ? region_mask(px) : 1.0;
+	float4 orig = image.Sample(textureSampler, v_in.uv);
+	return lerp(orig, mosaic, m);
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSMosaic(v_in);
+	}
+}

@@ -1,0 +1,60 @@
+// StreamSpook for OBS
+// Copyright (C) 2026 Fortyworks
+// SPDX-License-Identifier: GPL-2.0-or-later
+// This file is part of a GPL-2.0-or-later program; see LICENSE.
+
+// ビネット（周辺減光）。
+//
+// 中心からの距離を「四角い距離」と「楕円の距離」で測って roundness で混ぜ、
+// radius から radius + softness にかけて color へ寄せる。
+
+uniform float4x4 ViewProj;
+uniform texture2d image;
+
+uniform float strength;   // 0..1   周辺の暗さ（アニメーション済み）
+uniform float radius;     // 0..1.5 暗くなり始める位置（中心 0、端 1）
+uniform float softness;   // 0..1.5 暗くなりきるまでの幅
+uniform float roundness;  // 0..1   0 で四角、1 で楕円
+uniform float4 color;     // 寄せる色
+
+sampler_state textureSampler {
+	Filter    = Linear;
+	AddressU  = Clamp;
+	AddressV  = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData vert_out;
+	vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv  = v_in.uv;
+	return vert_out;
+}
+
+float4 PSVignette(VertData v_in) : TARGET
+{
+	float4 c = image.Sample(textureSampler, v_in.uv);
+
+	float2 d = abs(v_in.uv - 0.5) * 2.0;          // 中心 0、辺 1
+	float rect = max(d.x, d.y);                    // 四角: 辺で 1
+	float circ = length(d) * 0.70710678;           // 楕円: 角で 1
+	float dist = lerp(rect, circ, roundness);
+
+	float v = smoothstep(radius, radius + max(softness, 0.001), dist) * strength;
+	c.rgb = lerp(c.rgb, color.rgb, v);
+	return c;
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSVignette(v_in);
+	}
+}

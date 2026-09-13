@@ -1,0 +1,116 @@
+// StreamSpook for OBS
+// Copyright (C) 2026 Fortyworks
+// SPDX-License-Identifier: GPL-2.0-or-later
+// This file is part of a GPL-2.0-or-later program; see LICENSE.
+
+// グリッチ（デジタルノイズ）。
+//
+// 乱れの波（burst）が frequency の確率で来て、来ている間だけ 4 つの乱れ
+// （横帯のずれ・ブロックの飛び・色ずれ・砂嵐）が強く出る。波の合間も
+// 少しだけ残して、strength だけ上げたときに「何も起きない」に見えないように
+// している。
+
+uniform float4x4 ViewProj;
+uniform texture2d image;
+
+uniform float2 uv_size;       // 対象の大きさ（px）
+uniform float time;           // 経過秒（speed 込み）
+uniform float strength;       // 0..1  乱れの強さ（アニメーション済み）
+uniform float frequency;      // 0..1  乱れの波が来る頻度
+uniform float slices;         // 0..1  横帯のずれ
+uniform float rgb_split;      // 0..1  色ずれ
+uniform float blocks;         // 0..1  ブロックの飛び
+uniform float static_noise;   // 0..1  砂嵐
+
+sampler_state textureSampler {
+	Filter    = Linear;
+	AddressU  = Clamp;
+	AddressV  = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData vert_out;
+	vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv  = v_in.uv;
+	return vert_out;
+}
+
+float hash11(float p)
+{
+	p = frac(p * 0.1031);
+	p *= p + 33.33;
+	p *= p + p;
+	return frac(p);
+}
+
+float hash21(float2 p)
+{
+	float3 p3 = frac(float3(p.x, p.y, p.x) * 0.1031);
+	p3 += dot(p3, float3(p3.y, p3.z, p3.x) + 33.33);
+	return frac((p3.x + p3.y) * p3.z);
+}
+
+// 横方向は画面の外へ出たぶんを反対側から回す（テレビの同期ずれの見え方）
+float2 wrap_x(float2 uv)
+{
+	return float2(frac(uv.x), saturate(uv.y));
+}
+
+float4 PSGlitch(VertData v_in) : TARGET
+{
+	// 波: 1 秒に 6 回引き直す。frequency が 1 なら常に波の中
+	float slot = floor(time * 6.0);
+	float burst = step(1.0 - frequency, hash11(slot * 1.31 + 0.5));
+	float s = strength * (0.12 + 0.88 * burst);
+
+	// コマ番号。ハッシュに入れる数が大きくなりすぎないよう折り返す
+	float frame = fmod(floor(time * 24.0), 4096.0);
+	float2 uv = v_in.uv;
+
+	// 横帯のずれ: 高さがコマごとに変わる帯を、確率で横にずらす
+	float band_count = 12.0 + hash11(frame * 0.7 + 1.0) * 30.0;
+	float band = floor(uv.y * band_count);
+	float active = step(1.0 - s * 0.6, hash21(float2(band, frame)));
+	float shift = (hash21(float2(band + 13.0, frame)) - 0.5) * 0.25 * slices * s * active;
+	uv.x += shift;
+
+	// ブロックの飛び: 16x9 のマス目のどれかが別の場所を写す
+	float2 bcell = floor(uv * float2(16.0, 9.0) + hash11(frame + 2.0) * 5.0);
+	float block_on = step(1.0 - blocks * s * 0.35, hash21(bcell + frame * 2.3));
+	uv += (float2(hash21(bcell + 1.0), hash21(bcell + 2.0)) - 0.5) * 0.08 * block_on;
+	uv = wrap_x(uv);
+
+	// 色ずれ: R と B を左右に引き離す
+	float split = rgb_split * s * 0.02 * (0.5 + hash11(frame * 3.3 + 4.0));
+	float4 cr = image.Sample(textureSampler, wrap_x(uv + float2(split, 0.0)));
+	float4 cg = image.Sample(textureSampler, uv);
+	float4 cb = image.Sample(textureSampler, wrap_x(uv - float2(split, 0.0)));
+	float4 c = float4(cr.r, cg.g, cb.b, cg.a);
+
+	// 飛んだブロックの半分は色を反転させる
+	float invert_on = block_on * step(0.5, hash21(bcell + 3.0));
+	c.rgb = lerp(c.rgb, 1.0 - c.rgb, invert_on * 0.6);
+
+	// 砂嵐: 2px 単位の粒。走査線ごとに強く出る行がある
+	float2 px2 = floor(v_in.uv * uv_size * 0.5);
+	float n = hash21(px2 + frame * 4.7) - 0.5;
+	float line_on = step(1.0 - static_noise * s * 0.5, hash21(float2(floor(v_in.uv.y * uv_size.y), frame)));
+	c.rgb += n * static_noise * s * (0.15 + 0.6 * line_on);
+
+	return c;
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSGlitch(v_in);
+	}
+}

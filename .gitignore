@@ -1,0 +1,12 @@
+# ビルド時に落としてくる OBS のソースと依存（数百 MB）。cmake が buildspec.json を見て取り直す
+/.deps/
+# CMakePresets.json の binaryDir
+/build_*/
+/release/
+*.lock.json
+# cmake/common/buildnumber.cmake が回すビルド番号のキャッシュ
+/cmake/.CMakeBuildNumber
+.DS_Store
+# tools/package.mjs の出来上がり
+/stream-spook-*-windows-x64.zip
+/stream-spook-*-windows-x64.zip.sha256
