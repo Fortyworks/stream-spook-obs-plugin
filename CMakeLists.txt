@@ -43,6 +43,9 @@ target_sources(
     src/mosaic-filter.c
     src/vignette-filter.c
     src/glitch-filter.c
+    src/chromatic-filter.c
+    src/grade-filter.c
+    src/lens-filter.c
 )
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})

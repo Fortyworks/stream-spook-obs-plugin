@@ -3,7 +3,8 @@
 [StreamSpook](https://streamspook.app) が OBS の中で受け持つぶん ―― 配信画面そのものに掛けるポストエフェクトなど、ブラウザソースのオーバーレイでは届かないもの ―― のネイティブプラグイン。モジュール名は `stream-spook`、土台は [obs-plugintemplate](https://github.com/obsproject/obs-plugintemplate)。
 
 - **ライセンス: GPL-2.0-or-later**（[LICENSE](./LICENSE)）。libobs が GPL-2.0-or-later で、そのヘッダのコード（マクロ・`static inline`）がこの DLL に直接含まれるため。StreamSpook 本体とは別のプログラムで、話すのは obs-websocket の JSON だけ
-- **いま入っているもの:** ポストエフェクト 5 種（古い映画 / 黒澤モード / モザイク / ビネット / グリッチ）
+- **公開しているのは [Fortyworks/stream-spook-obs-plugin](https://github.com/Fortyworks/stream-spook-obs-plugin)。** リリースごとのスナップショット（1 版 = 1 コミット）で、開発の履歴と PR は入っていない。開発は非公開のリポジトリで行い、タグを打つと Actions がミラーへ積む（「5. 公開リポジトリ（ミラー）」）
+- **いま入っているもの:** ポストエフェクト 8 種（古い映画 / 黒澤モード / モザイク / ビネット / グリッチ / 色収差 / カラーグレーディング / レンズのゆがみ）
 - **配り方:** Release の zip を StreamSpook 本体が同梱し、アプリの「OBS プラグイン」ページから OBS のユーザー用プラグインフォルダへ入れる。手で入れることもできる（下）
 
 ## 1. ビルド（Windows）
@@ -32,7 +33,7 @@ node tools/package.mjs              # release/ と stream-spook-<版>-windows-x6
 cmake --install build_x64 --config RelWithDebInfo --prefix "$env:APPDATA\obs-studio\plugins"
 ```
 
-置かれるのは `%APPDATA%\obs-studio\plugins\stream-spook\bin\64bit\stream-spook.dll` と `…\stream-spook\data\`。**OBS を再起動**すると、フィルタ一覧に「StreamSpook: …」が 5 つ並ぶ。外すときはこのフォルダごと消す。
+置かれるのは `%APPDATA%\obs-studio\plugins\stream-spook\bin\64bit\stream-spook.dll` と `…\stream-spook\data\`。**OBS を再起動**すると、フィルタ一覧に「StreamSpook: …」が 8 つ並ぶ。外すときはこのフォルダごと消す。
 
 - OBS が起動中だと DLL の上書きに失敗する（初回の新規コピーは通る）
 - ポータブルモードの OBS は `%APPDATA%` を見ないので、この置き場所では読まれない
@@ -43,7 +44,7 @@ cmake --install build_x64 --config RelWithDebInfo --prefix "$env:APPDATA\obs-stu
 pwsh tools/smoke/Run-Smoke.ps1
 ```
 
-`.deps` の OBS ソースから `libobs-d3d11` を組み、プラグインを libobs に読み込んで 5 つのフィルタを作り（＝ `.effect` を実際にコンパイルし）、単色のソースに掛けてピクセルを読み戻す。終了コード 0 で OK。シェーダーのエラーは `[obs 300]` 以下の行に出る。`.effect` を触ったら必ず回す。
+`.deps` の OBS ソースから `libobs-d3d11` を組み、プラグインを libobs に読み込んで全フィルタを作り（＝ `.effect` を実際にコンパイルし）、2 色のソースに掛けてピクセルを読み戻す（座標をずらすものは境目の色が動くこと、樽型のゆがみは角が透明になることまで見る）。終了コード 0 で OK。シェーダーのエラーは `[obs 300]` 以下の行に出る。`.effect` を触ったら必ず回す。
 
 ### 文言の見張り
 
@@ -125,6 +126,45 @@ C が引いているキーが `data/locale/en-US.ini` と `ja-JP.ini` の両方�
 | `slices` / `rgb_split` / `blocks` / `noise` | 0..1 | 乱れの内訳（横帯のずれ / 色ずれ / ブロックの飛び / 砂嵐） |
 | `speed` | 0.25..4 | 乱れの速さ |
 
+### 色収差 `stream_spook_chromatic`
+
+揺らす対象: `strength`。R と B を G からずらして拾う。
+
+| キー | 範囲 | 意味 |
+|---|---|---|
+| `radial` | 0..1 | 端に向かうずれ（中心からの距離に比例。角で最大 3%） |
+| `shift` | 0..1 | 一方向のずれ（画面幅の最大 1%） |
+| `angle` | 0..360 | 一方向のずれの向き（度。0 で右、90 で下） |
+
+### カラーグレーディング `stream_spook_grade`
+
+揺らす対象: `strength`（元の絵との混ぜ具合）。順番はルック → 露出 → ホワイトバランス → コントラスト → 彩度 → スプリットトーン。
+
+| キー | 範囲 | 意味 |
+|---|---|---|
+| `look` | 0 なし / 1 ティール＆オレンジ / 2 暖色 / 3 寒色 / 4 ブリーチバイパス / 5 ヴィンテージ | 決め打ちの色の作り（出発点） |
+| `look_amount` | 0..1 | ルックの強さ |
+| `exposure` | -2..2 | 露出（EV。1 で 2 倍） |
+| `contrast` | 0.5..2 | コントラスト |
+| `saturation` | 0..2 | 彩度 |
+| `vibrance` | -1..1 | 自然な彩度（彩度の低い色ほど効く） |
+| `temperature` | -1..1 | 色温度（正で暖かく） |
+| `tint` | -1..1 | 色かぶり（正でマゼンタ、負で緑） |
+| `shadow_color` / `shadow_amount` | ABGR / 0..1 | 暗部に寄せる色と量 |
+| `highlight_color` / `highlight_amount` | ABGR / 0..1 | 明部に寄せる色と量 |
+| `balance` | -1..1 | 暗部と明部の境目 |
+
+### レンズのゆがみ `stream_spook_lens`
+
+揺らす対象: `amount`。
+
+| キー | 範囲 | 意味 |
+|---|---|---|
+| `amount` | -1..1 | ゆがみ。正で樽型（辺が外へふくらむ）、負で糸巻き型。0 で素通し |
+| `dispersion` | 0..1 | 色ごとにゆがみをずらす（色収差） |
+| `fit` | bool | 樽型のときに角が元の外を指さないよう内側へ寄せる（既定オン） |
+| `transparent` | bool | 元の外を指した所を透明にする（偽なら端の色を伸ばす。既定オン） |
+
 ## 3. つくり
 
 ```
@@ -137,6 +177,7 @@ src/
   fx-anim.{h,c}       「強さ」を動かす共通部品（移り変わり＋揺らし）と、その設定欄
   film-filter.c       セピアと黒澤（1 つの effect の technique 違い）
   mosaic-filter.c / vignette-filter.c / glitch-filter.c
+  chromatic-filter.c / grade-filter.c / lens-filter.c
 data/
   effects/*.effect    描き方そのもの（HLSL 風の OBS effect）
   locale/{en-US,ja-JP}.ini
@@ -167,3 +208,22 @@ tools/
 4. StreamSpook 本体の `src-tauri/obs-plugin.json` に版と sha256 を書く。本体のリリースがその zip を取って同梱する
 
 `manifest.json`（`{ "version": "…" }`）と `stream-spook/` の並びは本体の `src-tauri/src/obs_plugin.rs` が読む契約なので、形を変えるときは両方を直す。
+
+## 5. 公開リポジトリ（ミラー）
+
+GPL の「ソースを渡す」義務は、公開用のミラー [Fortyworks/stream-spook-obs-plugin](https://github.com/Fortyworks/stream-spook-obs-plugin) で満たす。こちら（開発用）は非公開のままで、履歴・PR・Actions の実行はここにしか残らない。
+
+タグ `v*` を打つと `build.yml` の `mirror` ジョブが:
+
+1. そのタグのツリーを `git archive` で取り出し（`.gitattributes` の `export-ignore` でワークフローは外す）、ミラーの `main` に **1 コミット**（メッセージは版の番号）として積んで、同じ番号のタグを打つ。作者は 1 つのアカウント（既定は the40san。メールは GitHub の noreply アドレス）にそろえるので、ミラーの履歴に他の名前は出ない。変えるならリポジトリ変数 `MIRROR_COMMIT_NAME` / `MIRROR_COMMIT_EMAIL`
+2. こちらの Release と**同じ zip / .sha256 をそのまま**ミラーの Release に置く（作り直さない。本体が固定している sha256 が、どちらから取っても一致するように）
+
+要るもの（このリポジトリの Settings）:
+
+| 種類 | 名前 | 値 |
+|---|---|---|
+| Variable | `MIRROR_REPO` | `Fortyworks/stream-spook-obs-plugin` |
+| Secret | `MIRROR_TOKEN` | ミラーに書ける fine-grained PAT（Repository access: ミラーだけ、Permissions: Contents = Read and write）。Release を作るのもこの token なので、作った人として出るのはその持ち主 |
+| Variable（任意） | `MIRROR_COMMIT_NAME` / `MIRROR_COMMIT_EMAIL` | スナップショットのコミットの作者。省略時は the40san |
+
+`MIRROR_REPO` が無ければジョブごと動かない（fork や手元の検証で勝手に push しない）。ミラー側には何も置かなくてよい（空のリポジトリで始められる）。zip の `README.txt` と本体の「OSS ライセンス」画面が指すのもミラーの URL。

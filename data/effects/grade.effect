@@ -1,0 +1,142 @@
+// StreamSpook for OBS
+// Copyright (C) 2026 Fortyworks
+// SPDX-License-Identifier: GPL-2.0-or-later
+// This file is part of a GPL-2.0-or-later program; see LICENSE.
+
+// カラーグレーディング。
+//
+// 順番: ルック（決め打ちの色の作り） → 露出 → ホワイトバランス → コントラスト
+//       → 彩度 / 自然な彩度 → スプリットトーン → 元の絵と混ぜる（strength）
+// ルックは「出発点」で、そのあとのつまみはその上に乗る。ガンマ空間のまま計算する
+// （見た目を作るエフェクトはそのほうが素直で、OBS の色補正フィルタも同じ）。
+
+uniform float4x4 ViewProj;
+uniform texture2d image;
+
+uniform float strength;        // 0..1  元の絵と混ぜる（アニメーション済み）
+uniform float look;            // 0 なし / 1 ティール＆オレンジ / 2 暖色 / 3 寒色 / 4 ブリーチ / 5 ヴィンテージ
+uniform float look_amount;     // 0..1
+uniform float exposure;        // -2..2 EV
+uniform float contrast;        // 0.5..2
+uniform float saturation;      // 0..2
+uniform float vibrance;        // -1..1  彩度の低いところほど効く
+uniform float temperature;     // -1..1  正で暖かく
+uniform float tint;            // -1..1  正でマゼンタ、負で緑
+uniform float4 shadow_color;   // 暗部に寄せる色
+uniform float shadow_amount;   // 0..1
+uniform float4 highlight_color; // 明部に寄せる色
+uniform float highlight_amount; // 0..1
+uniform float balance;         // -1..1  暗部と明部の境目
+
+sampler_state textureSampler {
+	Filter    = Linear;
+	AddressU  = Clamp;
+	AddressV  = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData vert_out;
+	vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv  = v_in.uv;
+	return vert_out;
+}
+
+float luma(float3 c)
+{
+	return dot(c, float3(0.2126, 0.7152, 0.0722));
+}
+
+// 暗部と明部を別の色へ寄せる。色は「灰色（0.5）からのずれ」として足すので、
+// 暗くする方向にも明るくする方向にも寄せられる
+float3 split_tone(float3 c, float3 sc, float sa, float3 hc, float ha, float bal)
+{
+	float t = saturate(luma(c) + bal * 0.5);
+	float wh = t * t * (3.0 - 2.0 * t);
+	float ws = 1.0 - wh;
+	c += (sc - 0.5) * ws * sa;
+	c += (hc - 0.5) * wh * ha;
+	return c;
+}
+
+float3 apply_contrast(float3 c, float k)
+{
+	return (c - 0.5) * k + 0.5;
+}
+
+float3 apply_saturation(float3 c, float k)
+{
+	float l = luma(c);
+	return lerp(float3(l, l, l), c, k);
+}
+
+// 決め打ちのルック。色を塗り替えただけの派生は足さず、見分けが付くものだけ置く
+float3 apply_look(float3 c, float id)
+{
+	if (id < 0.5)
+		return c;
+	if (id < 1.5) {
+		// ティール＆オレンジ: 暗部を青緑、明部を橙へ。映画のポスターの色
+		c = split_tone(c, float3(0.20, 0.55, 0.65), 0.35, float3(0.85, 0.60, 0.35), 0.35, 0.0);
+		return apply_contrast(c, 1.12);
+	}
+	if (id < 2.5) {
+		// 暖色: 夕方の光。ぜんたいを琥珀に寄せ、明部を金色に
+		c *= float3(1.06, 1.00, 0.90);
+		return split_tone(c, float3(0.5, 0.5, 0.5), 0.0, float3(0.95, 0.80, 0.55), 0.25, 0.0);
+	}
+	if (id < 3.5) {
+		// 寒色: 青い朝。ぜんたいを青に寄せ、暗部を紺に
+		c *= float3(0.92, 0.98, 1.08);
+		return split_tone(c, float3(0.35, 0.45, 0.70), 0.30, float3(0.5, 0.5, 0.5), 0.0, 0.0);
+	}
+	if (id < 4.5) {
+		// ブリーチバイパス: 彩度を落としてコントラストを上げる。銀残しの見え方
+		c = apply_saturation(c, 0.5);
+		return apply_contrast(c, 1.35);
+	}
+	// ヴィンテージ: 黒が浮き、彩度が落ち、暗部が茶色に、明部がクリーム色に
+	c = c * 0.85 + 0.08;
+	c = apply_saturation(c, 0.8);
+	c = split_tone(c, float3(0.55, 0.40, 0.30), 0.30, float3(0.95, 0.90, 0.75), 0.20, 0.0);
+	return apply_contrast(c, 0.95);
+}
+
+float4 PSGrade(VertData v_in) : TARGET
+{
+	float4 src = image.Sample(textureSampler, v_in.uv);
+	float3 c = src.rgb;
+
+	c = lerp(c, apply_look(c, look), look_amount);
+
+	// 露出: 1 EV で 2 倍
+	c *= exp2(exposure);
+
+	// ホワイトバランス。色温度は R と B を反対に、色かぶりは G を動かす
+	c *= float3(1.0 + temperature * 0.15, 1.0 - tint * 0.10, 1.0 - temperature * 0.15);
+
+	c = apply_contrast(c, contrast);
+
+	// 彩度。自然な彩度は、いま彩度の低い色ほど強く効かせる
+	c = apply_saturation(c, saturation);
+	float sat_now = max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b));
+	c = apply_saturation(c, 1.0 + vibrance * (1.0 - saturate(sat_now)));
+
+	c = split_tone(c, shadow_color.rgb, shadow_amount, highlight_color.rgb, highlight_amount, balance);
+
+	return float4(lerp(src.rgb, saturate(c), strength), src.a);
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSGrade(v_in);
+	}
+}

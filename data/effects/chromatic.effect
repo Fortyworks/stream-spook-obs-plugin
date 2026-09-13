@@ -1,0 +1,68 @@
+// StreamSpook for OBS
+// Copyright (C) 2026 Fortyworks
+// SPDX-License-Identifier: GPL-2.0-or-later
+// This file is part of a GPL-2.0-or-later program; see LICENSE.
+
+// 色収差。
+//
+// R と B を G からずらして拾う。ずらし方は 2 つあって、足し合わせる。
+//   - 半径方向（radial）: 中心からの距離に比例して外へ / 内へ。レンズの色収差の見え方
+//   - 一方向（shift）:    画面ぜんたいを同じ向きにずらす。VHS やグリッチ寄りの見え方
+
+uniform float4x4 ViewProj;
+uniform texture2d image;
+
+uniform float2 uv_size;    // 対象の大きさ（px）
+uniform float strength;    // 0..1  ぜんたいの強さ（アニメーション済み）
+uniform float radial;      // 0..1  半径方向のずれ
+uniform float shift;       // 0..1  一方向のずれ
+uniform float2 shift_dir;  // 一方向のずれの向き（単位ベクトル。C 側で角度から作る）
+
+sampler_state textureSampler {
+	Filter    = Linear;
+	AddressU  = Clamp;
+	AddressV  = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData vert_out;
+	vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv  = v_in.uv;
+	return vert_out;
+}
+
+float4 PSChromatic(VertData v_in) : TARGET
+{
+	float2 uv = v_in.uv;
+	float2 d = uv - 0.5;
+
+	// 半径方向: 角で 3% ずれるのが最大
+	float k = radial * strength * 0.03;
+
+	// 一方向: 画面幅の 1% が最大。縦は横と同じ px になるよう縦横比で割る
+	float2 s = shift_dir * (shift * strength * 0.01);
+	s.y *= uv_size.x / uv_size.y;
+
+	float2 uv_r = 0.5 + d * (1.0 + k) + s;
+	float2 uv_b = 0.5 + d * (1.0 - k) - s;
+
+	float4 cr = image.Sample(textureSampler, uv_r);
+	float4 cg = image.Sample(textureSampler, uv);
+	float4 cb = image.Sample(textureSampler, uv_b);
+	return float4(cr.r, cg.g, cb.b, cg.a);
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSChromatic(v_in);
+	}
+}

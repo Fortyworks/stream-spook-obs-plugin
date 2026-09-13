@@ -1,0 +1,83 @@
+// StreamSpook for OBS
+// Copyright (C) 2026 Fortyworks
+// SPDX-License-Identifier: GPL-2.0-or-later
+// This file is part of a GPL-2.0-or-later program; see LICENSE.
+
+// レンズのゆがみ（樽型 / 糸巻き型）。
+//
+// 出力の各ピクセルについて「元のどこを拾うか」を半径で決める（Brown–Conrady の 1 次）:
+//   r_src = r * (1 + k * r^2)
+// k > 0 で樽型（辺が外へふくらむ。角は元の外を指すので、fit で内側へ寄せるか透明にする）、
+// k < 0 で糸巻き型。半径は角で 1 になるよう正規化してあるので、縦横比が変わっても
+// 同じ k で同じ見え方になる。dispersion は R と B の k を少しずらして色収差を足す。
+
+uniform float4x4 ViewProj;
+uniform texture2d image;
+
+uniform float2 uv_size;          // 対象の大きさ（px）
+uniform float amount;            // -1..1  ゆがみ（アニメーション済み）。正で樽型
+uniform float dispersion;        // 0..1   色ごとの k のずれ
+uniform float zoom;              // fit のときは C 側が解いた倍率、それ以外は 1
+uniform bool transparent_outside; // 元の外を指したピクセルを透明にする（偽なら端を伸ばす）
+
+sampler_state textureSampler {
+	Filter    = Linear;
+	AddressU  = Clamp;
+	AddressV  = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData vert_out;
+	vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv  = v_in.uv;
+	return vert_out;
+}
+
+float2 warp(float2 d, float k)
+{
+	float r2 = dot(d, d);
+	return d * (1.0 + k * r2);
+}
+
+float4 PSLens(VertData v_in) : TARGET
+{
+	// 角で長さ 1 になる座標へ
+	float aspect = uv_size.x / uv_size.y;
+	float2 norm = float2(aspect, 1.0) * (2.0 / length(float2(aspect, 1.0)));
+	float2 d = (v_in.uv - 0.5) * norm * zoom;
+
+	float k = amount * 0.75;
+	float kr = k * (1.0 + dispersion * 0.08);
+	float kb = k * (1.0 - dispersion * 0.08);
+
+	float2 uv_r = warp(d, kr) / norm + 0.5;
+	float2 uv_g = warp(d, k) / norm + 0.5;
+	float2 uv_b = warp(d, kb) / norm + 0.5;
+
+	float4 cr = image.Sample(textureSampler, uv_r);
+	float4 cg = image.Sample(textureSampler, uv_g);
+	float4 cb = image.Sample(textureSampler, uv_b);
+	float4 c = float4(cr.r, cg.g, cb.b, cg.a);
+
+	if (transparent_outside) {
+		float2 o = abs(uv_g - 0.5);
+		float inside = step(max(o.x, o.y), 0.5);
+		c *= inside;
+	}
+	return c;
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSLens(v_in);
+	}
+}

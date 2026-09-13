@@ -14,6 +14,7 @@
  * then render a solid-color source through it and read pixels back */
 #include <obs.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int failures = 0;
@@ -68,6 +69,10 @@ static void color_render(void *d, gs_effect_t *e)
 	gs_technique_begin(tech);
 	gs_technique_begin_pass(tech, 0);
 	gs_draw_sprite(NULL, 0, TW, TH);
+	/* 左 1/4 だけ別の色。座標をずらすフィルタ（ゆがみ・色収差）の効きを、境目で読む */
+	vec4_set(&c, 0.9f, 0.6f, 0.2f, 1.0f);
+	gs_effect_set_vec4(gs_effect_get_param_by_name(solid, "color"), &c);
+	gs_draw_sprite(NULL, 0, TW / 4, TH);
 	gs_technique_end_pass(tech);
 	gs_technique_end(tech);
 }
@@ -83,8 +88,11 @@ static struct obs_source_info color_info = {
 	.video_render = color_render,
 };
 
+/* 境目（x = TW/4）のすぐ左。ここの色が動けば、座標をずらすフィルタが効いている */
+#define PROBE_X (TW / 4 - 2)
+
 /* render src (with its filters) into a texture and read a few pixels back */
-static bool render_and_read(obs_source_t *src, uint8_t center[4], uint8_t corner[4])
+static bool render_and_read(obs_source_t *src, uint8_t center[4], uint8_t corner[4], uint8_t probe[4])
 {
 	bool ok = false;
 	obs_enter_graphics();
@@ -104,6 +112,7 @@ static bool render_and_read(obs_source_t *src, uint8_t center[4], uint8_t corner
 		if (gs_stagesurface_map(stage, &data, &linesize)) {
 			memcpy(center, data + (TH / 2) * linesize + (TW / 2) * 4, 4);
 			memcpy(corner, data + 2 * linesize + 2 * 4, 4);
+			memcpy(probe, data + (TH / 2) * linesize + PROBE_X * 4, 4);
 			gs_stagesurface_unmap(stage);
 			ok = true;
 		}
@@ -114,7 +123,21 @@ static bool render_and_read(obs_source_t *src, uint8_t center[4], uint8_t corner
 	return ok;
 }
 
-static void try_filter(const char *id, obs_data_t *settings)
+/* 描いた結果に何を求めるか */
+enum expect {
+	EXPECT_NONE = 0,
+	/* 角が透明になっている（レンズのゆがみで元の外を指した所） */
+	EXPECT_CORNER_TRANSPARENT = 1,
+	/* 境目のすぐ左の色が、素通しのときの色（左側の色）から変わっている（座標がずれた） */
+	EXPECT_PROBE_MOVED = 2,
+};
+
+static bool same_rgb(const uint8_t *a, const uint8_t *b)
+{
+	return abs(a[0] - b[0]) <= 2 && abs(a[1] - b[1]) <= 2 && abs(a[2] - b[2]) <= 2;
+}
+
+static void try_filter_expect(const char *id, obs_data_t *settings, enum expect expect)
 {
 	obs_source_t *s = obs_source_create_private(id, "t", settings);
 	if (!s) {
@@ -130,15 +153,26 @@ static void try_filter(const char *id, obs_data_t *settings)
 
 	obs_source_t *src = obs_source_create_private("smoke_color", "c", NULL);
 	obs_source_filter_add(src, s);
-	uint8_t c[4] = {0}, k[4] = {0};
-	bool ok = render_and_read(src, c, k);
-	printf("%s %s (%s): %d props; center=(%d,%d,%d,%d) corner=(%d,%d,%d,%d)\n", ok ? "OK " : "NG ", id,
-	       obs_source_get_display_name(id), n, c[0], c[1], c[2], c[3], k[0], k[1], k[2], k[3]);
+	uint8_t c[4] = {0}, k[4] = {0}, p[4] = {0};
+	bool ok = render_and_read(src, c, k, p);
+	const uint8_t left[3] = {229, 153, 51};
+	if (ok && expect == EXPECT_CORNER_TRANSPARENT && k[3] != 0)
+		ok = false;
+	if (ok && expect == EXPECT_PROBE_MOVED && same_rgb(p, left))
+		ok = false;
+	printf("%s %s (%s): %d props; center=(%d,%d,%d,%d) corner=(%d,%d,%d,%d) probe=(%d,%d,%d,%d)\n",
+	       ok ? "OK " : "NG ", id, obs_source_get_display_name(id), n, c[0], c[1], c[2], c[3], k[0], k[1], k[2],
+	       k[3], p[0], p[1], p[2], p[3]);
 	if (!ok)
 		failures++;
 	obs_source_filter_remove(src, s);
 	obs_source_release(src);
 	obs_source_release(s);
+}
+
+static void try_filter(const char *id, obs_data_t *settings)
+{
+	try_filter_expect(id, settings, EXPECT_NONE);
 }
 
 int main(int argc, char **argv)
@@ -188,10 +222,10 @@ int main(int argc, char **argv)
 	obs_register_source(&color_info);
 	{
 		obs_source_t *src = obs_source_create_private("smoke_color", "c", NULL);
-		uint8_t c[4] = {0}, k[4] = {0};
-		render_and_read(src, c, k);
-		printf("REF plain source: center=(%d,%d,%d,%d) corner=(%d,%d,%d,%d)\n", c[0], c[1], c[2], c[3], k[0],
-		       k[1], k[2], k[3]);
+		uint8_t c[4] = {0}, k[4] = {0}, p[4] = {0};
+		render_and_read(src, c, k, p);
+		printf("REF plain source: center=(%d,%d,%d,%d) corner=(%d,%d,%d,%d) probe=(%d,%d,%d,%d)\n", c[0], c[1],
+		       c[2], c[3], k[0], k[1], k[2], k[3], p[0], p[1], p[2], p[3]);
 		obs_source_release(src);
 	}
 	try_filter("stream_spook_sepia", NULL);
@@ -222,6 +256,45 @@ int main(int argc, char **argv)
 		obs_data_set_double(d, "frequency", 1.0);
 		obs_data_set_int(d, "anim_mode", 2);
 		try_filter("stream_spook_glitch", d);
+		obs_data_release(d);
+	}
+
+	try_filter("stream_spook_chromatic", NULL);
+	{
+		/* 一方向のずれだけを最大にして、境目の色が混ざることを見る
+		 * （半径方向を残すと、この位置では 2 つのずれが打ち消し合う） */
+		obs_data_t *d = obs_data_create();
+		obs_data_set_double(d, "strength", 1.0);
+		obs_data_set_double(d, "radial", 0.0);
+		obs_data_set_double(d, "shift", 1.0);
+		try_filter_expect("stream_spook_chromatic", d, EXPECT_PROBE_MOVED);
+		obs_data_release(d);
+	}
+	try_filter("stream_spook_grade", NULL);
+	{
+		obs_data_t *d = obs_data_create();
+		obs_data_set_int(d, "look", 1);
+		obs_data_set_double(d, "shadow_amount", 0.5);
+		obs_data_set_double(d, "highlight_amount", 0.5);
+		try_filter("stream_spook_grade", d);
+		obs_data_release(d);
+	}
+	try_filter("stream_spook_lens", NULL);
+	{
+		/* 樽型で寄せない: 角は元の外を指すので透明になる */
+		obs_data_t *d = obs_data_create();
+		obs_data_set_double(d, "amount", 0.8);
+		obs_data_set_bool(d, "fit", false);
+		try_filter_expect("stream_spook_lens", d, EXPECT_CORNER_TRANSPARENT);
+		obs_data_release(d);
+	}
+	{
+		/* 糸巻き型 + 色のにじみ: 境目の色が動く */
+		obs_data_t *d = obs_data_create();
+		obs_data_set_double(d, "amount", -0.8);
+		obs_data_set_double(d, "dispersion", 1.0);
+		obs_data_set_bool(d, "fit", false);
+		try_filter_expect("stream_spook_lens", d, EXPECT_PROBE_MOVED);
 		obs_data_release(d);
 	}
 
