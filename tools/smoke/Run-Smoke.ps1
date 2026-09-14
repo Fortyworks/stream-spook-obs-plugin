@@ -3,8 +3,10 @@
 # やること:
 #   1. .deps に落としてある OBS のソースから libobs-d3d11 を組む（初回だけ数十秒）
 #   2. smoke.c を cl で組む
-#   3. プラグインを読み込み、5 つのフィルタを作って（= .effect をコンパイルして）
-#      単色のソースに掛け、ピクセルを読み戻す
+#   3. 帯の計算（spectrum-analyzer.c）を libobs 無しで確かめる
+#   4. プラグインを読み込み、全フィルタを作って（= .effect をコンパイルして）
+#      単色のソースに掛け、ピクセルを読み戻す。オーディオビジュアライザーは
+#      偽の obs-websocket（vendor API）を先に置いて、購読・音・期限まで見る
 #
 # 前提: `cmake --preset windows-x64` と `cmake --build --preset windows-x64` が
 # 済んでいること（.deps と build_x64 があること）。
@@ -59,13 +61,20 @@ rem vcvars64.bat が中で vswhere を呼ぶ。PATH に無いと警告を吐く�
 set "PATH=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer;%PATH%"
 call "$vs\VC\Auxiliary\Build\vcvars64.bat" >nul
 cd /d "$out"
-cl /nologo /W3 /wd4996 /I "$deps\include" "$PSScriptRoot\smoke.c" /link "$deps\lib\obs.lib" /OUT:smoke.exe
+cl /nologo /W3 /wd4996 /utf-8 /I "$deps\include" /I "$root\src" "$PSScriptRoot\smoke.c" /link "$deps\lib\obs.lib" /OUT:smoke.exe
 "@ | Set-Content -Encoding ascii $bat
 Write-Host "== build smoke.exe"
 cmd /c $bat
 if ($LASTEXITCODE -ne 0) { throw "smoke.exe のビルドに失敗" }
 
-# 3. run
+# 3. 帯の計算だけを libobs 無しで確かめる（CMake の target。配布物には入らない）
+Write-Host "== analyzer test"
+& $cmake --build (Join-Path $root "build_x64") --config RelWithDebInfo --target spectrum-analyzer-test | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "spectrum-analyzer-test のビルドに失敗" }
+& (Join-Path $root "build_x64\RelWithDebInfo\spectrum-analyzer-test.exe")
+if ($LASTEXITCODE -ne 0) { throw "spectrum-analyzer-test が失敗" }
+
+# 4. run
 Write-Host "== run"
 $env:PATH = "$prebuilt;$runBin;$env:PATH"
 Push-Location $runBin

@@ -11,11 +11,21 @@
  */
 /* headless smoke test: start libobs with D3D11, load the plugin module,
  * create every filter (this compiles the .effect files), build its properties,
- * then render a solid-color source through it and read pixels back */
+ * then render a solid-color source through it and read pixels back.
+ *
+ * The audio spectrum (src/spectrum.c) is exercised too: obs-websocket is not
+ * loaded here, so a tiny fake of its vendor API (it is only proc_handler calls)
+ * is installed before the module loads. The test subscribes to a tone source,
+ * checks that spectrum events carry the tone in the right band, and that the
+ * tap is dropped when the lease is not renewed. */
 #include <obs.h>
+#include <util/platform.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "obs-websocket-api.h"
 
 static int failures = 0;
 
@@ -175,12 +185,326 @@ static void try_filter(const char *id, obs_data_t *settings)
 	try_filter_expect(id, settings, EXPECT_NONE);
 }
 
+/* ---- fake obs-websocket: vendor API is nothing but proc_handler calls ---- */
+#define MAX_VENDOR_REQS 8
+static proc_handler_t *fake_ph;
+static struct {
+	char type[64];
+	obs_websocket_request_callback_function cb;
+	void *priv;
+} vendor_reqs[MAX_VENDOR_REQS];
+static size_t vendor_req_count;
+static int vendor_events;
+static char last_event[8192];
+
+static void fake_get_ph(void *data, calldata_t *cd)
+{
+	(void)data;
+	calldata_set_ptr(cd, "ph", fake_ph);
+}
+static void fake_vendor_register(void *data, calldata_t *cd)
+{
+	(void)data;
+	calldata_set_ptr(cd, "vendor", (void *)0x1);
+}
+static void fake_request_register(void *data, calldata_t *cd)
+{
+	(void)data;
+	const char *type = calldata_string(cd, "type");
+	struct obs_websocket_request_callback *cb = calldata_ptr(cd, "callback");
+	if (!type || !cb || vendor_req_count >= MAX_VENDOR_REQS)
+		return;
+	strncpy(vendor_reqs[vendor_req_count].type, type, sizeof(vendor_reqs[0].type) - 1);
+	vendor_reqs[vendor_req_count].cb = cb->callback;
+	vendor_reqs[vendor_req_count].priv = cb->priv_data;
+	vendor_req_count++;
+	calldata_set_bool(cd, "success", true);
+}
+static void fake_event_emit(void *data, calldata_t *cd)
+{
+	(void)data;
+	obs_data_t *d = calldata_ptr(cd, "data");
+	const char *json = d ? obs_data_get_json(d) : NULL;
+	if (json)
+		strncpy(last_event, json, sizeof(last_event) - 1);
+	vendor_events++;
+	calldata_set_bool(cd, "success", true);
+}
+static void install_fake_websocket(void)
+{
+	fake_ph = proc_handler_create();
+	proc_handler_add(fake_ph, "void vendor_register(in string name, out ptr vendor)", fake_vendor_register, NULL);
+	proc_handler_add(
+		fake_ph,
+		"void vendor_request_register(in ptr vendor, in string type, in ptr callback, out bool success)",
+		fake_request_register, NULL);
+	proc_handler_add(fake_ph,
+			 "void vendor_event_emit(in ptr vendor, in string type, in ptr data, out bool success)",
+			 fake_event_emit, NULL);
+	proc_handler_add(obs_get_proc_handler(), "void obs_websocket_api_get_ph(out ptr ph)", fake_get_ph, NULL);
+}
+/* call a vendor request the way obs-websocket would (request / response as obs_data) */
+static obs_data_t *vendor_call(const char *type, obs_data_t *req)
+{
+	for (size_t i = 0; i < vendor_req_count; i++) {
+		if (strcmp(vendor_reqs[i].type, type) == 0) {
+			obs_data_t *res = obs_data_create();
+			vendor_reqs[i].cb(req, res, vendor_reqs[i].priv);
+			return res;
+		}
+	}
+	printf("NG  vendor request not registered: %s\n", type);
+	failures++;
+	return obs_data_create();
+}
+
+/* ---- a tone source: 1 kHz sine pushed by hand (no thread needed) ---- */
+#define TONE_SR 48000
+#define TONE_FRAMES 1024
+static const char *tone_name(void *d)
+{
+	(void)d;
+	return "smoke tone";
+}
+static struct obs_source_info tone_info = {
+	.id = "smoke_tone",
+	.type = OBS_SOURCE_TYPE_INPUT,
+	.output_flags = OBS_SOURCE_AUDIO,
+	.get_name = tone_name,
+	.create = color_create,
+	.destroy = color_destroy,
+};
+static void tone_push(obs_source_t *src, uint64_t *phase, uint64_t ts)
+{
+	static float buf[TONE_FRAMES];
+	for (int i = 0; i < TONE_FRAMES; i++) {
+		buf[i] = 0.5f * (float)sin(2.0 * 3.14159265358979323846 * 1000.0 * (double)(*phase + i) / TONE_SR);
+	}
+	*phase += TONE_FRAMES;
+	struct obs_source_audio sa = {0};
+	sa.data[0] = (const uint8_t *)buf;
+	sa.frames = TONE_FRAMES;
+	sa.speakers = SPEAKERS_MONO;
+	sa.format = AUDIO_FORMAT_FLOAT;
+	sa.samples_per_sec = TONE_SR;
+	sa.timestamp = ts;
+	obs_source_output_audio(src, &sa);
+}
+/* feed the tone for `ms` while the plugin ticks; returns events seen meanwhile */
+static int tone_feed(obs_source_t *src, uint64_t *phase, int ms)
+{
+	const int before = vendor_events;
+	uint64_t ts = os_gettime_ns();
+	for (int t = 0; t < ms; t += 21) {
+		tone_push(src, phase, ts);
+		ts += (uint64_t)TONE_FRAMES * 1000000000ULL / TONE_SR;
+		os_sleep_ms(21);
+	}
+	return vendor_events - before;
+}
+
+/* pick the "b" of the tap `key` out of the last spectrum event; returns peak band index or -1 */
+static int last_event_peak(const char *key, int *peak_value)
+{
+	if (!last_event[0])
+		return -1;
+	obs_data_t *ev = obs_data_create_from_json(last_event);
+	obs_data_array_t *taps = ev ? obs_data_get_array(ev, "taps") : NULL;
+	int at = -1;
+	*peak_value = 0;
+	size_t n = taps ? obs_data_array_count(taps) : 0;
+	for (size_t i = 0; i < n; i++) {
+		obs_data_t *item = obs_data_array_item(taps, i);
+		if (strcmp(obs_data_get_string(item, "k"), key) == 0) {
+			const char *b = obs_data_get_string(item, "b");
+			int idx = 0;
+			at = 0; /* present (maybe silent) */
+			for (const char *p = b; p && *p; idx++) {
+				int v = atoi(p);
+				if (v > *peak_value) {
+					*peak_value = v;
+					at = idx;
+				}
+				p = strchr(p, ',');
+				if (p)
+					p++;
+			}
+		}
+		obs_data_release(item);
+	}
+	if (taps)
+		obs_data_array_release(taps);
+	if (ev)
+		obs_data_release(ev);
+	return at;
+}
+
+static obs_data_t *keys_request(const char *k1, const char *k2, const char *k3)
+{
+	obs_data_t *req = obs_data_create();
+	obs_data_array_t *keys = obs_data_array_create();
+	const char *ks[3] = {k1, k2, k3};
+	for (int i = 0; i < 3; i++) {
+		if (!ks[i])
+			continue;
+		obs_data_t *o = obs_data_create();
+		obs_data_set_string(o, "key", ks[i]);
+		obs_data_array_push_back(keys, o);
+		obs_data_release(o);
+	}
+	obs_data_set_array(req, "keys", keys);
+	obs_data_array_release(keys);
+	return req;
+}
+
+static void test_spectrum(void)
+{
+	printf("== audio spectrum\n");
+	if (vendor_req_count != 3) {
+		printf("NG  expected 3 vendor requests, got %zu\n", vendor_req_count);
+		failures++;
+		return;
+	}
+	printf("OK  3 vendor requests registered\n");
+
+	obs_register_source(&tone_info);
+	obs_source_t *tone = obs_source_create("smoke_tone", "tone", NULL, NULL);
+	char input_key[80];
+	snprintf(input_key, sizeof input_key, "input-%s", obs_source_get_uuid(tone));
+	uint64_t phase = 0;
+
+	/* the tone shows up in the source list, video-only sources do not */
+	{
+		obs_data_t *res = vendor_call("spectrum_sources", NULL);
+		obs_data_array_t *inputs = obs_data_get_array(res, "inputs");
+		bool found = false, color = false;
+		size_t n = inputs ? obs_data_array_count(inputs) : 0;
+		for (size_t i = 0; i < n; i++) {
+			obs_data_t *it = obs_data_array_item(inputs, i);
+			if (strcmp(obs_data_get_string(it, "kind"), "smoke_tone") == 0 &&
+			    strcmp(obs_data_get_string(it, "uuid"), obs_source_get_uuid(tone)) == 0)
+				found = true;
+			if (strcmp(obs_data_get_string(it, "kind"), "smoke_color") == 0)
+				color = true;
+			obs_data_release(it);
+		}
+		printf("%s spectrum_sources lists the tone (%zu inputs, tracks=%lld, sampleRate=%lld)\n",
+		       found && !color ? "OK " : "NG ", n, obs_data_get_int(res, "tracks"),
+		       obs_data_get_int(res, "sampleRate"));
+		if (!found || color)
+			failures++;
+		if (inputs)
+			obs_data_array_release(inputs);
+		obs_data_release(res);
+	}
+
+	/* subscribe: the tone and track 1 are accepted, a bogus key is rejected */
+	{
+		obs_data_t *req = keys_request(input_key, "track-1", "bogus");
+		obs_data_t *res = vendor_call("spectrum_subscribe", req);
+		obs_data_array_t *active = obs_data_get_array(res, "active");
+		obs_data_array_t *rejected = obs_data_get_array(res, "rejected");
+		size_t na = active ? obs_data_array_count(active) : 0;
+		size_t nr = rejected ? obs_data_array_count(rejected) : 0;
+		bool ok = false;
+		if (nr == 1) {
+			obs_data_t *r = obs_data_array_item(rejected, 0);
+			ok = na == 2 && strcmp(obs_data_get_string(r, "reason"), "unknown") == 0;
+			printf("%s subscribe: %zu active, %zu rejected (%s: %s)\n", ok ? "OK " : "NG ", na, nr,
+			       obs_data_get_string(r, "key"), obs_data_get_string(r, "reason"));
+			obs_data_release(r);
+		} else {
+			printf("NG  subscribe: %zu active, %zu rejected\n", na, nr);
+		}
+		if (!ok)
+			failures++;
+		if (active)
+			obs_data_array_release(active);
+		if (rejected)
+			obs_data_array_release(rejected);
+		obs_data_release(res);
+		obs_data_release(req);
+	}
+
+	/* feed the tone: events arrive, and the 1 kHz peak sits in the right band */
+	{
+		int got = tone_feed(tone, &phase, 400);
+		int peak = 0;
+		int at = last_event_peak(input_key, &peak);
+		/* 64 log bands from 30 Hz to 16 kHz: 1 kHz lands near band 36 */
+		bool ok = got > 5 && at >= 30 && at <= 40 && peak > 200;
+		printf("%s tone events: %d in 400ms, peak band %d (value %d)\n", ok ? "OK " : "NG ", got, at, peak);
+		if (!ok)
+			failures++;
+	}
+
+	/* unsubscribe the tone: later events no longer carry it */
+	{
+		obs_data_t *req = keys_request(input_key, NULL, NULL);
+		obs_data_t *res = vendor_call("spectrum_unsubscribe", req);
+		obs_data_release(res);
+		obs_data_release(req);
+		last_event[0] = '\0';
+		tone_feed(tone, &phase, 200);
+		int peak = 0;
+		int at = last_event_peak(input_key, &peak);
+		printf("%s unsubscribed tone is gone from events (%d)\n", at < 0 ? "OK " : "NG ", at);
+		if (at >= 0)
+			failures++;
+	}
+
+	/* lease: subscribe again, then stop renewing; the tap is dropped after ~6s */
+	{
+		obs_data_t *req = keys_request(input_key, NULL, NULL);
+		obs_data_t *res = vendor_call("spectrum_subscribe", req);
+		obs_data_release(res);
+		obs_data_release(req);
+		int got = tone_feed(tone, &phase, 300);
+		printf("%s re-subscribed tone streams again (%d events)\n", got > 3 ? "OK " : "NG ", got);
+		if (got <= 3)
+			failures++;
+		/* the track tap from the start was never renewed either, so after the
+		 * lease everything goes quiet even though the tone keeps playing */
+		tone_feed(tone, &phase, 6500);
+		got = tone_feed(tone, &phase, 400);
+		printf("%s lease expired: no events while the tone plays (%d)\n", got == 0 ? "OK " : "NG ", got);
+		if (got != 0)
+			failures++;
+	}
+
+	/* a source removed while tapped: no crash, and re-subscribing is rejected */
+	{
+		obs_data_t *req = keys_request(input_key, NULL, NULL);
+		obs_data_t *res = vendor_call("spectrum_subscribe", req);
+		obs_data_release(res);
+		obs_data_release(req);
+		tone_feed(tone, &phase, 100);
+		obs_source_remove(tone);
+		os_sleep_ms(120);
+		req = keys_request(input_key, NULL, NULL);
+		res = vendor_call("spectrum_subscribe", req);
+		obs_data_array_t *rejected = obs_data_get_array(res, "rejected");
+		size_t nr = rejected ? obs_data_array_count(rejected) : 0;
+		printf("%s removed source is rejected on re-subscribe (%zu)\n", nr == 1 ? "OK " : "NG ", nr);
+		if (nr != 1)
+			failures++;
+		if (rejected)
+			obs_data_array_release(rejected);
+		obs_data_release(res);
+		obs_data_release(req);
+	}
+
+	obs_source_release(tone);
+}
+
 int main(int argc, char **argv)
 {
 	if (argc < 4) {
 		fprintf(stderr, "usage: smoke <libobs data dir> <plugin dll> <plugin data dir>\n");
 		return 2;
 	}
+	/* crash diagnostics: do not lose the lines printed before an access violation */
+	setvbuf(stdout, NULL, _IONBF, 0);
 	base_set_log_handler(log_handler, NULL);
 	if (!obs_startup("ja-JP", NULL, NULL)) {
 		printf("obs_startup failed\n");
@@ -207,6 +531,16 @@ int main(int argc, char **argv)
 		printf("obs_reset_video failed: %d\n", r);
 		return 1;
 	}
+	struct obs_audio_info oai = {0};
+	oai.samples_per_sec = TONE_SR;
+	oai.speakers = SPEAKERS_STEREO;
+	if (!obs_reset_audio(&oai)) {
+		printf("obs_reset_audio failed\n");
+		return 1;
+	}
+
+	/* before the module loads: the vendor API is looked up in obs_module_post_load */
+	install_fake_websocket();
 
 	obs_module_t *mod = NULL;
 	r = obs_open_module(&mod, argv[2], argv[3]);
@@ -218,6 +552,7 @@ int main(int argc, char **argv)
 		printf("obs_init_module failed\n");
 		return 1;
 	}
+	obs_post_load_modules();
 
 	obs_register_source(&color_info);
 	{
@@ -297,6 +632,8 @@ int main(int argc, char **argv)
 		try_filter_expect("stream_spook_lens", d, EXPECT_PROBE_MOVED);
 		obs_data_release(d);
 	}
+
+	test_spectrum();
 
 	obs_shutdown();
 	printf("failures=%d\n", failures);

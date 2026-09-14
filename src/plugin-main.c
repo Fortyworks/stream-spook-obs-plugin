@@ -11,12 +11,14 @@
  */
 /*
  * オーバーレイ（ブラウザソース）だけでは届かないもの ― 配信画面そのものに
- * 掛けるポストエフェクトなど ― を OBS の中で受け持つ。
- * アプリ本体からは obs-websocket の SetSourceFilterSettings /
- * SetSourceFilterEnabled で叩く前提。
+ * 掛けるポストエフェクトや、OBS の中を流れる音 ― を OBS の中で受け持つ。
+ * アプリ本体からは obs-websocket で叩く前提（フィルタは SetSourceFilterSettings /
+ * SetSourceFilterEnabled、音は vendor API。spectrum.c）。
  */
 #include <obs-module.h>
 #include <plugin-support.h>
+
+#include "spectrum.h"
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
@@ -55,7 +57,14 @@ bool obs_module_load(void)
 	return true;
 }
 
+/* obs-websocket の vendor API は、全モジュールが読み込まれたあとでしか使えない */
+void obs_module_post_load(void)
+{
+	spectrum_init();
+}
+
 void obs_module_unload(void)
 {
+	spectrum_shutdown();
 	obs_log(LOG_INFO, "plugin unloaded");
 }

@@ -46,6 +46,13 @@ target_sources(
     src/chromatic-filter.c
     src/grade-filter.c
     src/lens-filter.c
+    src/spectrum-analyzer.c
+    src/spectrum.c
 )
+
+# 帯の計算だけを libobs 無しで確かめる（tools/smoke/analyzer-test.c）。
+# 配布物には入らない（install するのはプラグインの target だけ）
+add_executable(spectrum-analyzer-test EXCLUDE_FROM_ALL tools/smoke/analyzer-test.c src/spectrum-analyzer.c)
+target_include_directories(spectrum-analyzer-test PRIVATE src)
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})

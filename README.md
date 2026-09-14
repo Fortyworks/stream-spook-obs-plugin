@@ -1,10 +1,10 @@
 # StreamSpook for OBS
 
-[StreamSpook](https://streamspook.app) が OBS の中で受け持つぶん ―― 配信画面そのものに掛けるポストエフェクトなど、ブラウザソースのオーバーレイでは届かないもの ―― のネイティブプラグイン。モジュール名は `stream-spook`、土台は [obs-plugintemplate](https://github.com/obsproject/obs-plugintemplate)。
+[StreamSpook](https://streamspook.app) が OBS の中で受け持つぶん ―― 配信画面そのものに掛けるポストエフェクトや、OBS の中を流れる音など、ブラウザソースのオーバーレイでは届かないもの ―― のネイティブプラグイン。モジュール名は `stream-spook`、土台は [obs-plugintemplate](https://github.com/obsproject/obs-plugintemplate)。
 
 - **ライセンス: GPL-2.0-or-later**（[LICENSE](./LICENSE)）。libobs が GPL-2.0-or-later で、そのヘッダのコード（マクロ・`static inline`）がこの DLL に直接含まれるため。StreamSpook 本体とは別のプログラムで、話すのは obs-websocket の JSON だけ
-- **公開しているのは [Fortyworks/stream-spook-obs-plugin](https://github.com/Fortyworks/stream-spook-obs-plugin)。** リリースごとのスナップショット（1 版 = 1 コミット）で、開発の履歴と PR は入っていない。開発は非公開のリポジトリで行い、タグを打つと Actions がミラーへ積む（「5. 公開リポジトリ（ミラー）」）
-- **いま入っているもの:** ポストエフェクト 8 種（古い映画 / 黒澤モード / モザイク / ビネット / グリッチ / 色収差 / カラーグレーディング / レンズのゆがみ）
+- **公開しているのは [Fortyworks/stream-spook-obs-plugin](https://github.com/Fortyworks/stream-spook-obs-plugin)。** リリースごとのスナップショット（1 版 = 1 コミット）で、開発の履歴と PR は入っていない。開発は非公開のリポジトリで行い、タグを打つと Actions がミラーへ積む（「6. 公開リポジトリ（ミラー）」）
+- **いま入っているもの:** ポストエフェクト 8 種（古い映画 / 黒澤モード / モザイク / ビネット / グリッチ / 色収差 / カラーグレーディング / レンズのゆがみ）と、オーディオビジュアライザー用の音の取り口（トラックのミックス / ソース 1 つ。「3. オーディオビジュアライザー」）
 - **配り方:** Release の zip を StreamSpook 本体が同梱し、アプリの「OBS プラグイン」ページから OBS のユーザー用プラグインフォルダへ入れる。手で入れることもできる（下）
 
 ## 1. ビルド（Windows）
@@ -27,16 +27,16 @@ node tools/package.mjs              # release/ と stream-spook-<版>-windows-x6
 
 ### 手で OBS に入れる
 
-管理者権限の要らないユーザー用の置き場所へ:
+OBS が Windows で探す置き場所（`%ProgramData%\obs-studio\plugins\<名前>\`。OBS 本体の `AddExtraModulePaths` は Windows では `GetProgramDataPath` を使う。**`%APPDATA%` は読まない**）へ:
 
 ```powershell
-cmake --install build_x64 --config RelWithDebInfo --prefix "$env:APPDATA\obs-studio\plugins"
+cmake --install build_x64 --config RelWithDebInfo --prefix "$env:ProgramData\obs-studio\plugins"
 ```
 
-置かれるのは `%APPDATA%\obs-studio\plugins\stream-spook\bin\64bit\stream-spook.dll` と `…\stream-spook\data\`。**OBS を再起動**すると、フィルタ一覧に「StreamSpook: …」が 8 つ並ぶ。外すときはこのフォルダごと消す。
+置かれるのは `%ProgramData%\obs-studio\plugins\stream-spook\bin\64bit\stream-spook.dll` と `…\stream-spook\data\`。`ProgramData` の直下はふつうのユーザーでもフォルダを作れるので、管理者権限はたいてい要らない。**OBS を再起動**すると、プラグインマネージャーに「StreamSpook for OBS」が、フィルタ一覧に「StreamSpook: …」が 8 つ並ぶ。外すときはこのフォルダごと消す。
 
 - OBS が起動中だと DLL の上書きに失敗する（初回の新規コピーは通る）
-- ポータブルモードの OBS は `%APPDATA%` を見ないので、この置き場所では読まれない
+- ポータブルモードの OBS は `ProgramData` を見ないので、この置き場所では読まれない
 
 ### OBS を起動せずに確かめる（smoke）
 
@@ -45,6 +45,8 @@ pwsh tools/smoke/Run-Smoke.ps1
 ```
 
 `.deps` の OBS ソースから `libobs-d3d11` を組み、プラグインを libobs に読み込んで全フィルタを作り（＝ `.effect` を実際にコンパイルし）、2 色のソースに掛けてピクセルを読み戻す（座標をずらすものは境目の色が動くこと、樽型のゆがみは角が透明になることまで見る）。終了コード 0 で OK。シェーダーのエラーは `[obs 300]` 以下の行に出る。`.effect` を触ったら必ず回す。
+
+オーディオビジュアライザー（`src/spectrum.c`）も同じ smoke が見る。obs-websocket は読み込まないので、vendor API の偽物（中身は proc_handler の呼び出しだけ）を先に置いてから、1kHz の正弦波を出すソースを購読し、イベントの帯が正しい位置に立つこと・`unsubscribe` で消えること・期限（6 秒）が切れると止まること・消したソースは受けないことを見る。帯の計算そのもの（`spectrum-analyzer.c`）は libobs 無しの `spectrum-analyzer-test`（CMake の target。配布物には入らない）が先に回る。CI でも回る。
 
 ### 文言の見張り
 
@@ -165,7 +167,31 @@ C が引いているキーが `data/locale/en-US.ini` と `ja-JP.ini` の両方�
 | `fit` | bool | 樽型のときに角が元の外を指さないよう内側へ寄せる（既定オン） |
 | `transparent` | bool | 元の外を指した所を透明にする（偽なら端の色を伸ばす。既定オン） |
 
-## 3. つくり
+## 3. オーディオビジュアライザー（音の取り口）
+
+StreamSpook 本体のカスタムオーバーレイにあるビジュアライザーは、既定では PC 全体の音（WASAPI のループバック）を本体が拾う。このプラグインが入っていると、**OBS の中を流れる音**を選べる。obs-websocket が流してくるのは音量（`InputVolumeMeters`）だけで周波数の成分が無いので、libobs の中で PCM を受けて FFT にかけ、帯の強さだけを外へ出す。
+
+| 鍵（key） | 取り口 | 何の音か |
+|---|---|---|
+| `track-<1..6>` | `obs_add_raw_audio_callback` | そのトラックのミックス。トラック 1 はふつう「配信へ出て行く音ぜんぶ」 |
+| `input-<uuid>` | `obs_source_add_audio_capture_callback` | ソース 1 つ。そのソースのフィルタを通ったあと、フェーダーの手前の音。ミュート中は無音。フィルタを付けて回る必要は無い |
+
+話し方は obs-websocket の **vendor API**（vendor 名 `stream-spook`）。本体は既に obs-websocket につながっているので、経路を増やさない。
+
+| 種類 | 名前 | 中身 |
+|---|---|---|
+| 要求 | `spectrum_sources` | → `{ version, sampleRate, tracks, inputs: [{ uuid, name, kind }] }`。音を持つ入力ソースの一覧（シーンは含まない） |
+| 要求 | `spectrum_subscribe` | `{ keys: [{ key }] }` → `{ active: [{ key }], rejected: [{ key, reason }] }`。`reason` は `unknown`（無い・消された・鍵の形が違う）/ `not_audio` / `full`。**呼ぶたびに期限が 6 秒延びる。** 本体は見ている絵があるあいだ 2 秒おきに呼び続け、本体が落ちても数秒で止まる |
+| 要求 | `spectrum_unsubscribe` | `{ keys: [{ key }] }` → `{}`。すぐ畳む |
+| イベント | `spectrum` | `{ taps: [{ k: key, b: "12,48,90,…" }] }`。毎秒 30 回。`b` は 0..255 が 64 個のコンマ区切り |
+
+- **配列の中身はオブジェクトだけ。** `obs_data` の配列は文字列や数を持てない（JSON から読むときに落ちる）ので、鍵は `{ key }` で包み、帯は文字列で載せる
+- **帯の切り方は本体の PC 音の経路と同じ**（2048 点・64 帯・30Hz〜16kHz の対数・底 -70dB・+2.5dB/oct の持ち上げ）。切り替えても同じ曲で棒の高さが変わらないようにするため。値を変えるときは本体の `src-tauri/src/spectrum.rs` と対で直す
+- **無音は 1 回だけ流す。** 全部 0 の配列を送り続けない。音が来ないまま止まっている取り口は 120ms で 0 を詰めて落とす
+- **誰も見ていないときは動かない。** 期限が切れた取り口は畳み、取り口が 1 つも無いあいだスレッドは 100ms おきに起きて何もしない
+- **`obs-websocket-api.h` は obs-websocket のリポジトリから写したもの**（GPL-2.0-or-later、`src/obs-websocket-api.h`）。リンクは要らない（proc_handler を引くだけ）。obs-websocket が無ければ `obs_websocket_register_vendor` が NULL を返すので、フィルタだけで動く
+
+## 4. つくり
 
 ```
 buildspec.json        名前・版・依存の版（版を上げるのはここだけ。Release のタグと一致させる）
@@ -178,13 +204,16 @@ src/
   film-filter.c       セピアと黒澤（1 つの effect の technique 違い）
   mosaic-filter.c / vignette-filter.c / glitch-filter.c
   chromatic-filter.c / grade-filter.c / lens-filter.c
+  spectrum.{h,c}      オーディオビジュアライザー用の音の取り口（vendor API・購読・期限）
+  spectrum-analyzer.{h,c}  帯の計算（libobs に依存しない。単体で確かめられる）
+  obs-websocket-api.h obs-websocket の vendor API（向こうのリポジトリの写し）
 data/
   effects/*.effect    描き方そのもの（HLSL 風の OBS effect）
   locale/{en-US,ja-JP}.ini
 tools/
   package.mjs         配布物（release/ と zip）を作る
   check-locale.mjs    文言の突き合わせ
-  smoke/              OBS を起動せずに読み込んで確かめる道具
+  smoke/              OBS を起動せずに読み込んで確かめる道具（analyzer-test.c は帯の計算だけを見る）
 ```
 
 決めごと:
@@ -198,9 +227,10 @@ tools/
 - **シェーダーは D3D11 と GLSL の両方で通る書き方にする。** OBS は macOS / Linux で HLSL 風の effect を GLSL に自動変換する。`for` と `int → float` のキャストは避けて関数を並べる、`half` / `line` / `round` / `noise` のような予約語を変数名に使わない、数の掛け算は小数リテラル（`2.0`）で書く
 - **時間は 1000 秒で折り返す**（`fx_advance_time`）。float の精度が落ちる前に戻す
 - **`strength` が 0 のフレームは `obs_source_skip_video_filter` で素通し。** 掛けていないのに GPU を食わない
+- **音は取るだけで、描かない。** 帯の強さを出すところまでがここの仕事で、棒の描き方・追従・色は本体のオーバーレイが持つ。鍵の形（`track-<n>` / `input-<uuid>`）とイベントの形は一度決めたら変えない（本体が名指しで叩く）
 - **秘密にしたいものを置かない。** このリポジトリは GPL で全部公開される。独自のロジックは StreamSpook 本体に置き、ここは「OBS の中でしかできないこと」を薄く受け持つ。本体のコードをここへ写さない（GPL になる）し、ここのコードを本体へ写さない（本体が GPL の派生物になる）
 
-## 4. リリース
+## 5. リリース
 
 1. `buildspec.json` の `version` を上げてコミット
 2. 同じ番号のタグを打つ: `git tag v0.2.0 && git push origin v0.2.0`
@@ -209,7 +239,7 @@ tools/
 
 `manifest.json`（`{ "version": "…" }`）と `stream-spook/` の並びは本体の `src-tauri/src/obs_plugin.rs` が読む契約なので、形を変えるときは両方を直す。
 
-## 5. 公開リポジトリ（ミラー）
+## 6. 公開リポジトリ（ミラー）
 
 GPL の「ソースを渡す」義務は、公開用のミラー [Fortyworks/stream-spook-obs-plugin](https://github.com/Fortyworks/stream-spook-obs-plugin) で満たす。こちら（開発用）は非公開のままで、履歴・PR・Actions の実行はここにしか残らない。
 

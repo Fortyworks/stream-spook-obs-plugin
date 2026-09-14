@@ -1,7 +1,7 @@
 // 配布物を作る。
 //
-// build_x64 の出来上がりを cmake --install で release/ に置き、そのまま OBS の
-// ユーザー用プラグインフォルダ（%APPDATA%\obs-studio\plugins）に入れられる形に
+// build_x64 の出来上がりを cmake --install で release/ に置き、そのまま OBS が
+// Windows で探すプラグインフォルダ（%ProgramData%\obs-studio\plugins）に入れられる形に
 // そろえる。StreamSpook 本体はこの zip を Release から取って同梱する
 // （manifest.json の形は本体側の src-tauri/src/obs_plugin.rs と対）。
 //
@@ -99,7 +99,7 @@ writeFileSync(
     "Licensed under the GNU General Public License v2.0 or later; see LICENSE.",
     "Source code: https://github.com/Fortyworks/stream-spook-obs-plugin",
     "",
-    "Install: put this folder at %APPDATA%\\obs-studio\\plugins\\stream-spook and restart OBS.",
+    "Install: put this folder at %ProgramData%\\obs-studio\\plugins\\stream-spook and restart OBS.",
     "",
   ].join("\r\n"),
 );
