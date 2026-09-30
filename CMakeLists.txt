@@ -48,6 +48,8 @@ target_sources(
     src/lens-filter.c
     src/spectrum-analyzer.c
     src/spectrum.c
+    src/stinger-transition.c
+    src/vendor.c
 )
 
 # 帯の計算だけを libobs 無しで確かめる（tools/smoke/analyzer-test.c）。

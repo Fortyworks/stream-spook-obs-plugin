@@ -66,11 +66,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "obs-websocket-api.h"
 #include "plugin-support.h"
 #include "spectrum-analyzer.h"
+#include "vendor.h"
 
-#define VENDOR_NAME "stream-spook"
 #define EVENT_SPECTRUM "spectrum"
 #define REQ_SOURCES "spectrum_sources"
 #define REQ_SUBSCRIBE "spectrum_subscribe"
@@ -559,9 +558,9 @@ void spectrum_init(void)
 	memset(&S, 0, sizeof(S));
 	pthread_mutex_init(&S.mutex, NULL);
 
-	S.vendor = obs_websocket_register_vendor(VENDOR_NAME);
+	S.vendor = ss_vendor();
 	if (!S.vendor) {
-		obs_log(LOG_INFO, "obs-websocket not available; audio spectrum is disabled");
+		obs_log(LOG_INFO, "audio spectrum is disabled (no obs-websocket)");
 		return;
 	}
 	obs_websocket_vendor_register_request(S.vendor, REQ_SOURCES, req_sources, NULL);
@@ -581,7 +580,7 @@ void spectrum_init(void)
 		return;
 	}
 	S.thread_started = true;
-	obs_log(LOG_INFO, "audio spectrum ready (vendor '%s', %d Hz, %d bands)", VENDOR_NAME, RATE_HZ, SPECTRUM_BANDS);
+	obs_log(LOG_INFO, "audio spectrum ready (%d Hz, %d bands)", RATE_HZ, SPECTRUM_BANDS);
 }
 
 void spectrum_shutdown(void)

@@ -17,7 +17,12 @@
  * loaded here, so a tiny fake of its vendor API (it is only proc_handler calls)
  * is installed before the module loads. The test subscribes to a tone source,
  * checks that spectrum events carry the tone in the right band, and that the
- * tap is dropped when the lease is not renewed. */
+ * tap is dropped when the lease is not renewed.
+ *
+ * The stinger transition (src/stinger-transition.c) is created the way the OBS
+ * UI does (a private source), configured through its vendor request, and run
+ * from one color source to another to see the cut happen at the point. obs-browser
+ * is not loaded, so the overlay page itself is not drawn here. */
 #include <obs.h>
 #include <util/platform.h>
 #include <math.h>
@@ -96,6 +101,34 @@ static struct obs_source_info color_info = {
 	.get_width = color_w,
 	.get_height = color_h,
 	.video_render = color_render,
+};
+
+/* スティンガーの行き先（B）。全面を 1 色で塗る */
+static void red_render(void *d, gs_effect_t *e)
+{
+	(void)d;
+	(void)e;
+	gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
+	struct vec4 c;
+	vec4_set(&c, 0.9f, 0.1f, 0.1f, 1.0f);
+	gs_effect_set_vec4(gs_effect_get_param_by_name(solid, "color"), &c);
+	gs_technique_t *tech = gs_effect_get_technique(solid, "Solid");
+	gs_technique_begin(tech);
+	gs_technique_begin_pass(tech, 0);
+	gs_draw_sprite(NULL, 0, TW, TH);
+	gs_technique_end_pass(tech);
+	gs_technique_end(tech);
+}
+static struct obs_source_info red_info = {
+	.id = "smoke_red",
+	.type = OBS_SOURCE_TYPE_INPUT,
+	.output_flags = OBS_SOURCE_VIDEO,
+	.get_name = color_name,
+	.create = color_create,
+	.destroy = color_destroy,
+	.get_width = color_w,
+	.get_height = color_h,
+	.video_render = red_render,
 };
 
 /* 境目（x = TW/4）のすぐ左。ここの色が動けば、座標をずらすフィルタが効いている */
@@ -360,12 +393,12 @@ static obs_data_t *keys_request(const char *k1, const char *k2, const char *k3)
 static void test_spectrum(void)
 {
 	printf("== audio spectrum\n");
-	if (vendor_req_count != 3) {
-		printf("NG  expected 3 vendor requests, got %zu\n", vendor_req_count);
+	if (vendor_req_count != 4) {
+		printf("NG  expected 4 vendor requests, got %zu\n", vendor_req_count);
 		failures++;
 		return;
 	}
-	printf("OK  3 vendor requests registered\n");
+	printf("OK  4 vendor requests registered (3 spectrum + 1 stinger)\n");
 
 	obs_register_source(&tone_info);
 	obs_source_t *tone = obs_source_create("smoke_tone", "tone", NULL, NULL);
@@ -495,6 +528,106 @@ static void test_spectrum(void)
 	}
 
 	obs_source_release(tone);
+}
+
+static obs_data_t *stinger_config(const char *url, int duration_ms, int point_ms)
+{
+	obs_data_t *req = obs_data_create();
+	obs_data_set_string(req, "url", url);
+	obs_data_set_int(req, "duration_ms", duration_ms);
+	obs_data_set_int(req, "point_ms", point_ms);
+	return req;
+}
+
+static void check(bool ok, const char *what)
+{
+	printf("%s %s\n", ok ? "OK " : "NG ", what);
+	if (!ok)
+		failures++;
+}
+
+static void test_stinger(void)
+{
+	printf("== stinger transition\n");
+
+	bool listed = false;
+	const char *id;
+	for (size_t i = 0; obs_enum_transition_types(i, &id); i++)
+		if (strcmp(id, "stream_spook_stinger") == 0)
+			listed = true;
+	check(listed, "stream_spook_stinger is a transition type");
+	check(obs_is_source_configurable("stream_spook_stinger"), "shows up in the + menu (configurable)");
+
+	/* 1 つも無いときに配っても 0 件。このあと作るものはこの設定で始まる */
+	{
+		obs_data_t *req = stinger_config("http://127.0.0.1:1/overlay/stinger?a=1", 400, 200);
+		obs_data_t *res = vendor_call("stinger_configure", req);
+		check(obs_data_get_int(res, "count") == 0, "configure with no stinger reports 0");
+		obs_data_release(res);
+		obs_data_release(req);
+	}
+
+	obs_source_t *tr = obs_source_create_private("stream_spook_stinger", "st", NULL);
+	check(tr != NULL, "create like the OBS UI does");
+	if (!tr)
+		return;
+	{
+		obs_data_t *st = obs_source_get_settings(tr);
+		check(strcmp(obs_data_get_string(st, "url"), "http://127.0.0.1:1/overlay/stinger?a=1") == 0 &&
+			      obs_data_get_int(st, "duration_ms") == 400,
+		      "a new stinger starts with the last configuration");
+		obs_data_release(st);
+	}
+	check(obs_transition_fixed(tr), "duration is fixed (the app decides it)");
+
+	/* 設定し直すと、いまあるものに届く */
+	{
+		obs_data_t *req = stinger_config("http://127.0.0.1:1/overlay/stinger?a=2", 600, 300);
+		obs_data_t *res = vendor_call("stinger_configure", req);
+		obs_data_t *st = obs_source_get_settings(tr);
+		check(obs_data_get_int(res, "count") == 1 &&
+			      strcmp(obs_data_get_string(st, "url"), "http://127.0.0.1:1/overlay/stinger?a=2") == 0 &&
+			      obs_data_get_int(st, "point_ms") == 300,
+		      "configure reaches the existing stinger");
+		obs_data_release(st);
+		obs_data_release(res);
+		obs_data_release(req);
+	}
+
+	/* 読み込み直したもの（自分の URL を持っている）は、最後に配った設定で上書きしない */
+	{
+		obs_data_t *saved = stinger_config("http://saved/", 900, 450);
+		obs_source_t *tr2 = obs_source_create_private("stream_spook_stinger", "st2", saved);
+		obs_data_t *st = obs_source_get_settings(tr2);
+		check(strcmp(obs_data_get_string(st, "url"), "http://saved/") == 0,
+		      "a loaded stinger keeps its own url");
+		obs_data_release(st);
+		obs_source_release(tr2);
+		obs_data_release(saved);
+	}
+
+	/* A → B。切り替え点（600ms 中の 300ms）の前は A、後は B が見える */
+	obs_register_source(&red_info);
+	obs_source_t *a = obs_source_create_private("smoke_color", "a", NULL);
+	obs_source_t *b = obs_source_create_private("smoke_red", "b", NULL);
+	obs_transition_set_size(tr, TW, TH);
+	obs_transition_set_scale_type(tr, OBS_TRANSITION_SCALE_ASPECT);
+	obs_transition_set(tr, a);
+	check(obs_transition_start(tr, OBS_TRANSITION_MODE_AUTO, 0, b), "transition starts");
+	uint8_t c[4] = {0}, k[4] = {0}, p[4] = {0};
+	const uint8_t blue[3] = {51, 153, 229};
+	const uint8_t red[3] = {229, 25, 25};
+	render_and_read(tr, c, k, p);
+	printf("    before the point: center=(%d,%d,%d,%d)\n", c[0], c[1], c[2], c[3]);
+	check(same_rgb(c, blue), "before the point shows A");
+	os_sleep_ms(420);
+	render_and_read(tr, c, k, p);
+	printf("    after the point: center=(%d,%d,%d,%d)\n", c[0], c[1], c[2], c[3]);
+	check(same_rgb(c, red), "after the point shows B");
+
+	obs_source_release(a);
+	obs_source_release(b);
+	obs_source_release(tr);
 }
 
 int main(int argc, char **argv)
@@ -634,6 +767,7 @@ int main(int argc, char **argv)
 	}
 
 	test_spectrum();
+	test_stinger();
 
 	obs_shutdown();
 	printf("failures=%d\n", failures);

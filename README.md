@@ -3,8 +3,8 @@
 [StreamSpook](https://streamspook.app) が OBS の中で受け持つぶん ―― 配信画面そのものに掛けるポストエフェクトや、OBS の中を流れる音など、ブラウザソースのオーバーレイでは届かないもの ―― のネイティブプラグイン。モジュール名は `stream-spook`、土台は [obs-plugintemplate](https://github.com/obsproject/obs-plugintemplate)。
 
 - **ライセンス: GPL-2.0-or-later**（[LICENSE](./LICENSE)）。libobs が GPL-2.0-or-later で、そのヘッダのコード（マクロ・`static inline`）がこの DLL に直接含まれるため。StreamSpook 本体とは別のプログラムで、話すのは obs-websocket の JSON だけ
-- **公開しているのは [Fortyworks/stream-spook-obs-plugin](https://github.com/Fortyworks/stream-spook-obs-plugin)。** リリースごとのスナップショット（1 版 = 1 コミット）で、開発の履歴と PR は入っていない。開発は非公開のリポジトリで行い、タグを打つと Actions がミラーへ積む（「6. 公開リポジトリ（ミラー）」）
-- **いま入っているもの:** ポストエフェクト 8 種（古い映画 / 黒澤モード / モザイク / ビネット / グリッチ / 色収差 / カラーグレーディング / レンズのゆがみ）と、オーディオビジュアライザー用の音の取り口（トラックのミックス / ソース 1 つ。「3. オーディオビジュアライザー」）
+- **公開しているのは [Fortyworks/stream-spook-obs-plugin](https://github.com/Fortyworks/stream-spook-obs-plugin)。** リリースごとのスナップショット（1 版 = 1 コミット）で、開発の履歴と PR は入っていない。開発は非公開のリポジトリで行い、タグを打つと Actions がミラーへ積む（「7. 公開リポジトリ（ミラー）」）
+- **いま入っているもの:** ポストエフェクト 8 種（古い映画 / 黒澤モード / モザイク / ビネット / グリッチ / 色収差 / カラーグレーディング / レンズのゆがみ）と、オーディオビジュアライザー用の音の取り口（トラックのミックス / ソース 1 つ。「3. オーディオビジュアライザー」）、シーントランジション「StreamSpook: スティンガー」（「4. スティンガー」）
 - **配り方:** Release の zip を StreamSpook 本体が同梱し、アプリの「OBS プラグイン」ページから OBS のユーザー用プラグインフォルダへ入れる。手で入れることもできる（下）
 
 ## 1. ビルド（Windows）
@@ -46,7 +46,7 @@ pwsh tools/smoke/Run-Smoke.ps1
 
 `.deps` の OBS ソースから `libobs-d3d11` を組み、プラグインを libobs に読み込んで全フィルタを作り（＝ `.effect` を実際にコンパイルし）、2 色のソースに掛けてピクセルを読み戻す（座標をずらすものは境目の色が動くこと、樽型のゆがみは角が透明になることまで見る）。終了コード 0 で OK。シェーダーのエラーは `[obs 300]` 以下の行に出る。`.effect` を触ったら必ず回す。
 
-オーディオビジュアライザー（`src/spectrum.c`）も同じ smoke が見る。obs-websocket は読み込まないので、vendor API の偽物（中身は proc_handler の呼び出しだけ）を先に置いてから、1kHz の正弦波を出すソースを購読し、イベントの帯が正しい位置に立つこと・`unsubscribe` で消えること・期限（6 秒）が切れると止まること・消したソースは受けないことを見る。帯の計算そのもの（`spectrum-analyzer.c`）は libobs 無しの `spectrum-analyzer-test`（CMake の target。配布物には入らない）が先に回る。CI でも回る。
+オーディオビジュアライザー（`src/spectrum.c`）も同じ smoke が見る。obs-websocket は読み込まないので、vendor API の偽物（中身は proc_handler の呼び出しだけ）を先に置いてから、1kHz の正弦波を出すソースを購読し、イベントの帯が正しい位置に立つこと・`unsubscribe` で消えること・期限（6 秒）が切れると止まること・消したソースは受けないことを見る。スティンガー（`src/stinger-transition.c`）は、OBS の画面と同じく private のソースとして作り、`stinger_configure` で設定が届くこと・読み直したものは上書きしないこと・2 色のソースのあいだで切り替え点の前後に A / B が見えることを見る（obs-browser は読み込まないので、ページの絵そのものはここでは出ない）。帯の計算そのもの（`spectrum-analyzer.c`）は libobs 無しの `spectrum-analyzer-test`（CMake の target。配布物には入らない）が先に回る。CI でも回る。
 
 ### 文言の見張り
 
@@ -191,7 +191,29 @@ StreamSpook 本体のカスタムオーバーレイにあるビジュアライ�
 - **誰も見ていないときは動かない。** 期限が切れた取り口は畳み、取り口が 1 つも無いあいだスレッドは 100ms おきに起きて何もしない
 - **`obs-websocket-api.h` は obs-websocket のリポジトリから写したもの**（GPL-2.0-or-later、`src/obs-websocket-api.h`）。リンクは要らない（proc_handler を引くだけ）。obs-websocket が無ければ `obs_websocket_register_vendor` が NULL を返すので、フィルタだけで動く
 
-## 4. つくり
+## 4. スティンガー（シーントランジション）
+
+`stream_spook_stinger`。OBS 標準のスティンガーと同じく、切り替えのあいだ前のシーン → 切り替え点で次のシーンを描き、その上に絵を重ねる。**重ねる絵は動画ファイルではなくブラウザソース**で、StreamSpook 本体のオーバーレイサーバーが配るページを開く。どんな絵を出すか（演出の種類・色・文字・音）は全部そのページと本体が決め、ここは「いつ流すか」「どこで替えるか」だけを受け持つ。
+
+- **ブラウザソースは作ったときに 1 つだけ作り、ずっと読み込んだままにする**（`shutdown` オフ＋ `obs_source_inc_showing`）。切り替えが始まったら obs-browser の `javascript_event`（proc_handler）でページへイベント `streamspook:stinger`（detail は `{ durationMs, pointMs }`）を投げる。毎回ページを読み直さないので、読み込みの待ちが切り替えに乗らない
+- **音はブラウザの音を OBS へ回し（`reroute_audio`）、切り替えの音として配信に乗せる。** シーンの音は標準のスティンガーの「フェードアウト→フェードイン」と同じ（切り替え点までに前を絞り、切り替え点から次を上げる）
+- **長さは固定**（`obs_transition_enable_fixed`）。OBS の「期間」欄は出ない
+- **OBS の一覧に足すのは配信者。** obs-websocket にも frontend API にもトランジションを足す口が無いので、「シーントランジション」の ＋ から 1 回だけ足してもらう。OBS 側のプロパティは案内の文だけ（`get_properties` が無いと ＋ の一覧に出てこない）
+- **本体が落ちているとき**はページが読めないので、絵の無いカットになる（切り替え点で替わるだけ）
+
+| キー | 型 | 意味 |
+|---|---|---|
+| `url` | string | 開くページ |
+| `duration_ms` | 100..20000 | 切り替えぜんたいの長さ |
+| `point_ms` | 0..duration_ms | 前のシーンから次のシーンへ替える位置（ページの絵が画面を覆っているところ） |
+
+| 種類 | 名前 | 中身 |
+|---|---|---|
+| 要求 | `stinger_configure` | `{ url, duration_ms, point_ms }` → `{ count }`。いまあるスティンガー全部に同じ設定を配り、このあと ＋ から作られるぶん（OBS を再起動するまで）もこの設定で始める。シーンコレクションから読み直したもの（自分の URL を持っている）は上書きしない。本体はつなぐたびに呼ぶ |
+
+- **vendor は 1 本（`src/vendor.c`）。** 同じ名前の vendor は 1 度しか登録できないので、音の取り口とスティンガーが同じ 1 本に要求を足す
+
+## 5. つくり
 
 ```
 buildspec.json        名前・版・依存の版（版を上げるのはここだけ。Release のタグと一致させる）
@@ -206,6 +228,8 @@ src/
   chromatic-filter.c / grade-filter.c / lens-filter.c
   spectrum.{h,c}      オーディオビジュアライザー用の音の取り口（vendor API・購読・期限）
   spectrum-analyzer.{h,c}  帯の計算（libobs に依存しない。単体で確かめられる）
+  stinger-transition.{h,c} シーントランジション「スティンガー」（ブラウザソースを重ねる）
+  vendor.{h,c}        obs-websocket の vendor（stream-spook）を 1 本だけ登録する
   obs-websocket-api.h obs-websocket の vendor API（向こうのリポジトリの写し）
 data/
   effects/*.effect    描き方そのもの（HLSL 風の OBS effect）
@@ -230,7 +254,7 @@ tools/
 - **音は取るだけで、描かない。** 帯の強さを出すところまでがここの仕事で、棒の描き方・追従・色は本体のオーバーレイが持つ。鍵の形（`track-<n>` / `input-<uuid>`）とイベントの形は一度決めたら変えない（本体が名指しで叩く）
 - **秘密にしたいものを置かない。** このリポジトリは GPL で全部公開される。独自のロジックは StreamSpook 本体に置き、ここは「OBS の中でしかできないこと」を薄く受け持つ。本体のコードをここへ写さない（GPL になる）し、ここのコードを本体へ写さない（本体が GPL の派生物になる）
 
-## 5. リリース
+## 6. リリース
 
 1. `buildspec.json` の `version` を上げてコミット
 2. 同じ番号のタグを打つ: `git tag v0.2.0 && git push origin v0.2.0`
@@ -239,7 +263,7 @@ tools/
 
 `manifest.json`（`{ "version": "…" }`）と `stream-spook/` の並びは本体の `src-tauri/src/obs_plugin.rs` が読む契約なので、形を変えるときは両方を直す。
 
-## 6. 公開リポジトリ（ミラー）
+## 7. 公開リポジトリ（ミラー）
 
 GPL の「ソースを渡す」義務は、公開用のミラー [Fortyworks/stream-spook-obs-plugin](https://github.com/Fortyworks/stream-spook-obs-plugin) で満たす。こちら（開発用）は非公開のままで、履歴・PR・Actions の実行はここにしか残らない。
 

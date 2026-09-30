@@ -68,11 +68,11 @@ for (const [file, map] of [["en-US.ini", en], ["ja-JP.ini", ja]]) {
 }
 // フィルタ ID は stream_spook_ で始める（obs-websocket の GetSourceFilterKindList で見分けるため）
 const ids = filterIds();
-if (ids.length === 0) problems.push("フィルタ ID が 1 つも見つからない");
+if (ids.length === 0) problems.push("ソースの種類 ID が 1 つも見つからない");
 for (const id of ids) if (!/^stream_spook_[a-z_]+$/.test(id)) problems.push(`フィルタ ID の付け方が違う: ${id}`);
 
 if (problems.length > 0) {
   console.error(problems.map((p) => `[check-locale] ${p}`).join("\n"));
   process.exit(1);
 }
-console.log(`[check-locale] OK（キー ${en.size} 件、フィルタ ${ids.length} 件）`);
+console.log(`[check-locale] OK（キー ${en.size} 件、種類 ${ids.length} 件）`);
