@@ -46,7 +46,7 @@ pwsh tools/smoke/Run-Smoke.ps1
 
 `.deps` の OBS ソースから `libobs-d3d11` を組み、プラグインを libobs に読み込んで全フィルタを作り（＝ `.effect` を実際にコンパイルし）、2 色のソースに掛けてピクセルを読み戻す（座標をずらすものは境目の色が動くこと、樽型のゆがみは角が透明になることまで見る）。終了コード 0 で OK。シェーダーのエラーは `[obs 300]` 以下の行に出る。`.effect` を触ったら必ず回す。
 
-オーディオビジュアライザー（`src/spectrum.c`）も同じ smoke が見る。obs-websocket は読み込まないので、vendor API の偽物（中身は proc_handler の呼び出しだけ）を先に置いてから、1kHz の正弦波を出すソースを購読し、イベントの帯が正しい位置に立つこと・`unsubscribe` で消えること・期限（6 秒）が切れると止まること・消したソースは受けないことを見る。スティンガー（`src/stinger-transition.c`）は、OBS の画面と同じく private のソースとして作り、`stinger_configure` で設定が届くこと・読み直したものは上書きしないこと・2 色のソースのあいだで切り替え点の前後に A / B が見えることを見る（obs-browser は読み込まないので、ページの絵そのものはここでは出ない）。帯の計算そのもの（`spectrum-analyzer.c`）は libobs 無しの `spectrum-analyzer-test`（CMake の target。配布物には入らない）が先に回る。CI でも回る。
+オーディオビジュアライザー（`src/spectrum.c`）も同じ smoke が見る。obs-websocket は読み込まないので、vendor API の偽物（中身は proc_handler の呼び出しだけ）を先に置いてから、1kHz の正弦波を出すソースを購読し、イベントの帯が正しい位置に立つこと・`unsubscribe` で消えること・期限（6 秒）が切れると止まること・消したソースは受けないことを見る。スティンガー（`src/stinger-transition.c`）は、OBS の画面と同じく private のソースとして作り、`stinger_configure` で設定（行き先ごとの `scenes` を含む）が届いて保存されること・読み直したものは上書きしないこと・長さを固定していないこと・OBS の長さ（1500ms）で回したとき、行き先ごとの設定がある行き先はその切り替え点で、無い行き先は既定の切り替え点で A / B が替わること・ページへ投げる detail（OBS の長さを測った `durationMs`、行き先の比の `pointMs`、`sceneUuid`、`elapsedMs`）・T バー（手動）では行き先の `duration_ms` を使うことを見る（obs-browser は読み込まないので、ページの絵そのものはここでは出ない。detail はスティンガーの proc `stinger_last_event` から読む。読むだけの口）。帯の計算そのもの（`spectrum-analyzer.c`）は libobs 無しの `spectrum-analyzer-test`（CMake の target。配布物には入らない）が先に回る。CI でも回る。
 
 ### 文言の見張り
 
@@ -195,21 +195,27 @@ StreamSpook 本体のカスタムオーバーレイにあるビジュアライ�
 
 `stream_spook_stinger`。OBS 標準のスティンガーと同じく、切り替えのあいだ前のシーン → 切り替え点で次のシーンを描き、その上に絵を重ねる。**重ねる絵は動画ファイルではなくブラウザソース**で、StreamSpook 本体のオーバーレイサーバーが配るページを開く。どんな絵を出すか（演出の種類・色・文字・音）は全部そのページと本体が決め、ここは「いつ流すか」「どこで替えるか」だけを受け持つ。
 
-- **ブラウザソースは作ったときに 1 つだけ作り、ずっと読み込んだままにする**（`shutdown` オフ＋ `obs_source_inc_showing`）。切り替えが始まったら obs-browser の `javascript_event`（proc_handler）でページへイベント `streamspook:stinger`（detail は `{ durationMs, pointMs }`）を投げる。毎回ページを読み直さないので、読み込みの待ちが切り替えに乗らない
+- **ブラウザソースは作ったときに 1 つだけ作り、ずっと読み込んだままにする**（`shutdown` オフ＋ `obs_source_inc_showing`）。切り替えが始まり、行き先のシーンが決まったら、obs-browser の `javascript_event`（proc_handler）でページへイベント `streamspook:stinger` を投げる（detail は下の表）。毎回ページを読み直さないので、読み込みの待ちが切り替えに乗らない
 - **音はブラウザの音を OBS へ回し（`reroute_audio`）、切り替えの音として配信に乗せる。** シーンの音は標準のスティンガーの「フェードアウト→フェードイン」と同じ（切り替え点までに前を絞り、切り替え点から次を上げる）
-- **長さは固定**（`obs_transition_enable_fixed`）。OBS の「期間」欄は出ない
+- **長さは OBS が持つ**（「期間」欄と、シーンごとの「トランジションの上書き」の期間）。固定の長さ（`obs_transition_enable_fixed`）は使わないので、OBS の「期間」欄が出る。本体は行き先のシーンごとに別の演出（長さ・切り替え点）を選べるが、OBS に置くスティンガーは 1 つで、libobs は `transition_start` を行き先を決める**前**に呼んで、その直後に固定の長さを読む。行き先ごとに固定の長さを切り替える隙も、途中で切り上げる公開 API も無いので、長さは本体が OBS に書き込む（既定は「期間」欄、シーンごとは `SetSceneSceneTransitionOverride`）
+- **行き先ごとの切り替え点はプラグインが選ぶ。** 行き先（B）が決まったら（自分の `transition_start` シグナル。libobs が B を置いたあとに出る）、次の `video_tick` でその uuid を `scenes` から探し、無ければ既定の値を使う。切り替え点は `point_ms / duration_ms` の比で、OBS の長さに掛けて使う（0.001..0.999 に丸める）。決まるまでの 1 フレームは前のシーンのまま
+- **実際の長さは測る。** libobs の t（0..1）と同じ時計で 2 フレーム見て「開始からの経過 / t」と「フレーム間の経過 / t の伸び」が合えば、それが OBS の長さ。合わない（スタジオモードの T バー。libobs に今のモードを読む口が無い）・50..60000ms の外・t が 0.5 秒動かない、のときはその行き先の `duration_ms` を使う
 - **OBS の一覧に足すのは配信者。** obs-websocket にも frontend API にもトランジションを足す口が無いので、「シーントランジション」の ＋ から 1 回だけ足してもらう。OBS 側のプロパティは案内の文だけ（`get_properties` が無いと ＋ の一覧に出てこない）
 - **本体が落ちているとき**はページが読めないので、絵の無いカットになる（切り替え点で替わるだけ）
+
+設定（`stinger_configure` で届いたものをそのまま持つ。シーンコレクションと一緒に保存される）:
 
 | キー | 型 | 意味 |
 |---|---|---|
 | `url` | string | 開くページ |
-| `duration_ms` | 100..20000 | 切り替えぜんたいの長さ |
-| `point_ms` | 0..duration_ms | 前のシーンから次のシーンへ替える位置（ページの絵が画面を覆っているところ） |
+| `duration_ms` | 100..20000 | 既定の演出の長さ（`scenes` に無い行き先に使う）。切り替え点の比を出すのと、長さを測れないときの代わりに使う |
+| `point_ms` | 0..duration_ms | 既定の切り替え点（前のシーンから次のシーンへ替える位置。ページの絵が画面を覆っているところ） |
+| `scenes` | `[{ uuid, duration_ms, point_ms }]` | 行き先のシーン（uuid）ごとの長さと切り替え点。範囲は上と同じ。uuid の無いもの・重なった uuid の 2 つ目は落とす（最大 256 件） |
 
 | 種類 | 名前 | 中身 |
 |---|---|---|
-| 要求 | `stinger_configure` | `{ url, duration_ms, point_ms }` → `{ count }`。いまあるスティンガー全部に同じ設定を配り、このあと ＋ から作られるぶん（OBS を再起動するまで）もこの設定で始める。シーンコレクションから読み直したもの（自分の URL を持っている）は上書きしない。本体はつなぐたびに呼ぶ |
+| 要求 | `stinger_configure` | `{ url, duration_ms, point_ms, scenes?: [{ uuid, duration_ms, point_ms }] }` → `{ count, per_scene: true }`。いまあるスティンガー全部に同じ設定を配り、このあと ＋ から作られるぶん（OBS を再起動するまで）もこの設定で始める。シーンコレクションから読み直したもの（自分の URL を持っている）は上書きしない。`scenes` を省くと空（前に配ったぶんは残さない）。`per_scene` は行き先ごとの切り替え点を知っている版（0.5.0〜）の目印。本体はつなぐたびに呼ぶ |
+| ページへのイベント | `streamspook:stinger` | detail は `{ durationMs, pointMs, sceneUuid, elapsedMs }`。`durationMs` は OBS の実際の長さ（測れないときは行き先の `duration_ms`）、`pointMs` はそれに切り替え点の比を掛けたもの、`sceneUuid` は行き先のシーンの uuid（`scenes` に無くても入る。行き先が無いときは空）、`elapsedMs` は投げた時点で OBS の切り替えが進んでいる量（行き先を決めて長さを測るのに 1〜2 フレーム掛かるので、ページはそのぶん先へ送って OBS と揃える）。切り替えの途中でまた切り替えられたら、決め直してもう一度投げる |
 
 - **vendor は 1 本（`src/vendor.c`）。** 同じ名前の vendor は 1 度しか登録できないので、音の取り口とスティンガーが同じ 1 本に要求を足す
 

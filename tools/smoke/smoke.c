@@ -20,9 +20,11 @@
  * tap is dropped when the lease is not renewed.
  *
  * The stinger transition (src/stinger-transition.c) is created the way the OBS
- * UI does (a private source), configured through its vendor request, and run
- * from one color source to another to see the cut happen at the point. obs-browser
- * is not loaded, so the overlay page itself is not drawn here. */
+ * UI does (a private source), configured through its vendor request (with a
+ * per-destination entry), and run from one color source to others to see the cut
+ * happen at the destination's point while OBS's duration drives the time. obs-browser
+ * is not loaded, so the overlay page itself is not drawn here; the event detail it
+ * would receive is read back through the stinger's "stinger_last_event" proc. */
 #include <obs.h>
 #include <util/platform.h>
 #include <math.h>
@@ -546,6 +548,70 @@ static void check(bool ok, const char *what)
 		failures++;
 }
 
+static void stinger_scene(obs_data_array_t *scenes, const char *uuid, int duration_ms, int point_ms)
+{
+	obs_data_t *o = obs_data_create();
+	obs_data_set_string(o, "uuid", uuid);
+	obs_data_set_int(o, "duration_ms", duration_ms);
+	obs_data_set_int(o, "point_ms", point_ms);
+	obs_data_array_push_back(scenes, o);
+	obs_data_release(o);
+}
+
+static size_t settings_scene_count(obs_data_t *st)
+{
+	obs_data_array_t *arr = obs_data_get_array(st, "scenes");
+	size_t n = arr ? obs_data_array_count(arr) : 0;
+	obs_data_array_release(arr);
+	return n;
+}
+
+/* settings の scenes から uuid の point_ms を引く。無ければ -1 */
+static long long settings_scene_point(obs_data_t *st, const char *uuid)
+{
+	obs_data_array_t *arr = obs_data_get_array(st, "scenes");
+	long long point = -1;
+	size_t n = arr ? obs_data_array_count(arr) : 0;
+	for (size_t i = 0; i < n; i++) {
+		obs_data_t *it = obs_data_array_item(arr, i);
+		if (strcmp(obs_data_get_string(it, "uuid"), uuid) == 0)
+			point = obs_data_get_int(it, "point_ms");
+		obs_data_release(it);
+	}
+	obs_data_array_release(arr);
+	return point;
+}
+
+/* 最後にページへ投げた detail を読んで確かめる（obs-browser が無いので、
+ * スティンガー自身の proc "stinger_last_event" から読む）。
+ * exact なら長さも経過もそのまま、でなければ実時間で測った長さなので 5% まで許す */
+static void check_event(obs_source_t *tr, int duration_ms, double ratio, const char *uuid, bool exact, const char *what)
+{
+	calldata_t cd = {0};
+	char json[512] = {0};
+	if (proc_handler_call(obs_source_get_proc_handler(tr), "stinger_last_event", &cd)) {
+		const char *j = calldata_string(&cd, "json");
+		if (j)
+			strncpy(json, j, sizeof(json) - 1);
+	}
+	calldata_free(&cd);
+	printf("    event: %s\n", json);
+
+	obs_data_t *ev = json[0] ? obs_data_create_from_json(json) : NULL;
+	bool ok = ev != NULL;
+	if (ok) {
+		const long long d = obs_data_get_int(ev, "durationMs");
+		const long long pt = obs_data_get_int(ev, "pointMs");
+		const long long el = obs_data_get_int(ev, "elapsedMs");
+		const double tol = exact ? 0.0 : duration_ms * 0.05;
+		ok = llabs(d - duration_ms) <= (long long)tol && llabs(pt - (long long)(d * ratio + 0.5)) <= 1 &&
+		     strcmp(obs_data_get_string(ev, "sceneUuid"), uuid) == 0 &&
+		     (exact ? el == (long long)(duration_ms * 0.5) : (el > 0 && el < 300));
+		obs_data_release(ev);
+	}
+	check(ok, what);
+}
+
 static void test_stinger(void)
 {
 	printf("== stinger transition\n");
@@ -562,7 +628,8 @@ static void test_stinger(void)
 	{
 		obs_data_t *req = stinger_config("http://127.0.0.1:1/overlay/stinger?a=1", 400, 200);
 		obs_data_t *res = vendor_call("stinger_configure", req);
-		check(obs_data_get_int(res, "count") == 0, "configure with no stinger reports 0");
+		check(obs_data_get_int(res, "count") == 0 && obs_data_get_bool(res, "per_scene"),
+		      "configure with no stinger reports 0 (and per_scene)");
 		obs_data_release(res);
 		obs_data_release(req);
 	}
@@ -578,7 +645,7 @@ static void test_stinger(void)
 		      "a new stinger starts with the last configuration");
 		obs_data_release(st);
 	}
-	check(obs_transition_fixed(tr), "duration is fixed (the app decides it)");
+	check(!obs_transition_fixed(tr), "duration is not fixed (OBS's duration / per-scene override drives it)");
 
 	/* 設定し直すと、いまあるものに届く */
 	{
@@ -606,27 +673,87 @@ static void test_stinger(void)
 		obs_data_release(saved);
 	}
 
-	/* A → B。切り替え点（600ms 中の 300ms）の前は A、後は B が見える */
+	/* 行き先ごとの設定。既定は 2000ms 中の 1600ms（0.8）、b だけ 3000ms 中の 300ms（0.1）。
+	 * c はどこにも無いので既定。OBS の長さはどちらでもなく 1500ms で回す */
 	obs_register_source(&red_info);
 	obs_source_t *a = obs_source_create_private("smoke_color", "a", NULL);
 	obs_source_t *b = obs_source_create_private("smoke_red", "b", NULL);
+	obs_source_t *c = obs_source_create_private("smoke_red", "c", NULL);
+	const char *b_uuid = obs_source_get_uuid(b);
+	const char *c_uuid = obs_source_get_uuid(c);
+	{
+		obs_data_t *req = stinger_config("http://127.0.0.1:1/overlay/stinger?a=3", 2000, 1600);
+		obs_data_array_t *scenes = obs_data_array_create();
+		stinger_scene(scenes, b_uuid, 3000, 300);
+		stinger_scene(scenes, "", 1000, 500); /* uuid が無いものは落とす */
+		obs_data_set_array(req, "scenes", scenes);
+		obs_data_array_release(scenes);
+		obs_data_t *res = vendor_call("stinger_configure", req);
+		check(obs_data_get_int(res, "count") == 1 && obs_data_get_bool(res, "per_scene"),
+		      "configure with scenes reports per_scene");
+		obs_data_t *st = obs_source_get_settings(tr);
+		check(settings_scene_point(st, b_uuid) == 300 && settings_scene_count(st) == 1,
+		      "scenes persist in the source settings");
+		obs_data_release(st);
+		obs_data_release(res);
+		obs_data_release(req);
+
+		/* このあと ＋ から作られるぶんも、行き先ごとの設定ごと始まる */
+		obs_source_t *tr3 = obs_source_create_private("stream_spook_stinger", "st3", NULL);
+		st = obs_source_get_settings(tr3);
+		check(settings_scene_point(st, b_uuid) == 300, "a new stinger starts with the last scenes");
+		obs_data_release(st);
+		obs_source_release(tr3);
+	}
+
 	obs_transition_set_size(tr, TW, TH);
 	obs_transition_set_scale_type(tr, OBS_TRANSITION_SCALE_ASPECT);
-	obs_transition_set(tr, a);
-	check(obs_transition_start(tr, OBS_TRANSITION_MODE_AUTO, 0, b), "transition starts");
-	uint8_t c[4] = {0}, k[4] = {0}, p[4] = {0};
+	uint8_t px[4] = {0}, k[4] = {0}, p[4] = {0};
 	const uint8_t blue[3] = {51, 153, 229};
 	const uint8_t red[3] = {229, 25, 25};
-	render_and_read(tr, c, k, p);
-	printf("    before the point: center=(%d,%d,%d,%d)\n", c[0], c[1], c[2], c[3]);
-	check(same_rgb(c, blue), "before the point shows A");
-	os_sleep_ms(420);
-	render_and_read(tr, c, k, p);
-	printf("    after the point: center=(%d,%d,%d,%d)\n", c[0], c[1], c[2], c[3]);
-	check(same_rgb(c, red), "after the point shows B");
+
+	/* A → b（行き先ごとの設定あり）。1500ms の 0.1 = 150ms で替わるので、450ms では B */
+	obs_transition_set(tr, a);
+	check(obs_transition_start(tr, OBS_TRANSITION_MODE_AUTO, 1500, b), "transition to b starts");
+	render_and_read(tr, px, k, p);
+	printf("    to b, at once: center=(%d,%d,%d,%d)\n", px[0], px[1], px[2], px[3]);
+	check(same_rgb(px, blue), "to b: shows A until the destination is resolved");
+	os_sleep_ms(450);
+	render_and_read(tr, px, k, p);
+	printf("    to b, 450ms: center=(%d,%d,%d,%d)\n", px[0], px[1], px[2], px[3]);
+	check(same_rgb(px, red), "to b: B at 450ms (per-scene point 0.1)");
+	check_event(tr, 1500, 0.1, b_uuid, false, "to b: event has OBS's length and b's point");
+	os_sleep_ms(1200);
+	render_and_read(tr, px, k, p); /* 終わりきったところを描かせて、transition_stop を通す */
+
+	/* A → c（どこにも無い行き先）。既定の 0.8 = 1200ms で替わる */
+	obs_transition_set(tr, a);
+	check(obs_transition_start(tr, OBS_TRANSITION_MODE_AUTO, 1500, c), "transition to c starts");
+	os_sleep_ms(450);
+	render_and_read(tr, px, k, p);
+	printf("    to c, 450ms: center=(%d,%d,%d,%d)\n", px[0], px[1], px[2], px[3]);
+	check(same_rgb(px, blue), "to c: still A at 450ms (default point 0.8)");
+	check_event(tr, 1500, 0.8, c_uuid, false, "to c: event has OBS's length and the default point");
+	os_sleep_ms(900);
+	render_and_read(tr, px, k, p);
+	printf("    to c, 1350ms: center=(%d,%d,%d,%d)\n", px[0], px[1], px[2], px[3]);
+	check(same_rgb(px, red), "to c: B at 1350ms");
+	os_sleep_ms(400);
+	render_and_read(tr, px, k, p);
+
+	/* スタジオモードの T バー（時間で動かない）。長さは b の 3000ms をそのまま使う */
+	obs_transition_set(tr, a);
+	check(obs_transition_start(tr, OBS_TRANSITION_MODE_MANUAL, 1500, b), "manual transition to b starts");
+	obs_transition_set_manual_time(tr, 0.5f);
+	os_sleep_ms(300);
+	render_and_read(tr, px, k, p);
+	check(same_rgb(px, red), "manual: B at t=0.5 (per-scene point 0.1)");
+	check_event(tr, 3000, 0.1, b_uuid, true, "manual: event falls back to b's own length");
+	obs_transition_set(tr, a);
 
 	obs_source_release(a);
 	obs_source_release(b);
+	obs_source_release(c);
 	obs_source_release(tr);
 }
 

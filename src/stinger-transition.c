@@ -27,9 +27,40 @@
  * ページは受けたそばから絵を動かす。毎回ページを読み直さないので、
  * 読み込みの待ちが切り替えに乗らない。
  *
+ * ─── 長さは OBS が持つ（行き先のシーンごとに違ってよい） ────────────────────
+ * 本体では行き先のシーンごとに別の演出（長さ・切り替え点）を選べる。OBS に置く
+ * スティンガーは 1 つなので、長さは OBS の「期間」欄と、シーンごとの
+ * 「トランジションの上書き」の期間（本体が SetSceneSceneTransitionOverride で
+ * 書く）に任せる。固定の長さ（obs_transition_enable_fixed）は使わない。
+ * libobs は transition_start を**行き先（B）を決める前**に呼び、その直後に
+ * 固定の長さを読むので、行き先ごとに固定の長さを切り替える隙が無いため。
+ * 途中で切り上げる公開 API も無いので、長さを決めるのは OBS 側だけにする。
+ *
+ * そのかわり、1 回の切り替えにつき 1 度だけ次を決める（video_tick。描画の
+ * スレッドだが graphics の文脈の外なので、proc_handler を呼んでも安全）:
+ *   1. 行き先: 自分の "transition_start" シグナル（libobs が B を決めたあとに出す）
+ *      で B の uuid を控え、次の tick で scenes の中から探す。無ければ既定の値。
+ *      切り替え点 = point_ms / duration_ms（0.001..0.999 に丸める）。
+ *      決まるまでは A を描く（まだ B を知らないので、替えようがない）
+ *   2. 実際の長さ: libobs の t（obs_transition_get_time）は
+ *      (obs->video.video_time − 開始時刻) / 長さ で、開始時刻は os_gettime_ns()。
+ *      同じ時計（obs_get_video_frame_time）で 2 フレーム見て、
+ *      「開始からの経過 / t」と「フレーム間の経過 / t の伸び」が一致すれば、
+ *      それが OBS の長さ。一致しなければ時間で動いていない＝スタジオモードの
+ *      T バー（OBS_TRANSITION_MODE_MANUAL。libobs に今のモードを読む口が無い）か、
+ *      おかしな値なので、その行き先の duration_ms を使う
+ *   3. ページへ EVENT_PLAY を投げる。detail は
+ *      { durationMs, pointMs, sceneUuid, elapsedMs }。
+ *      pointMs は実際の長さに切り替え点の比を掛けたもの。elapsedMs は投げた
+ *      時点で OBS の切り替えが進んでいる量（t × durationMs）で、ページはそのぶん
+ *      先へ送って OBS と揃える（決めるのに 1〜2 フレーム掛かるため）
+ *
  * ─── 話し方（obs-websocket の vendor API。vendor 名 "stream-spook"） ────────
- *   要求 stinger_configure  { url, duration_ms, point_ms }
- *                           → { count }（設定したスティンガーの数）
+ *   要求 stinger_configure  { url, duration_ms, point_ms,
+ *                             scenes?: [{ uuid, duration_ms, point_ms }] }
+ *                           → { count, per_scene: true }
+ *   上の duration_ms / point_ms は scenes に無い行き先に使う既定の値。
+ *   per_scene は「行き先ごとの切り替え点を知っている版」の目印（0.4 は返さない）。
  *
  * OBS のトランジションの一覧に足す口は obs-websocket にも frontend API にも無い
  * ので、足すのは配信者が OBS の「シーントランジション」の ＋ から 1 回だけやる。
@@ -40,7 +71,11 @@
 #include <obs-module.h>
 #include <util/darray.h>
 #include <util/dstr.h>
+#include <util/platform.h>
 #include <util/threading.h>
+
+#include <math.h>
+#include <string.h>
 
 #include "plugin-support.h"
 #include "vendor.h"
@@ -48,23 +83,69 @@
 #define REQ_CONFIGURE "stinger_configure"
 /* ページに投げるイベントの名前（window に CustomEvent として届く。detail は JSON） */
 #define EVENT_PLAY "streamspook:stinger"
+/* 最後にページへ投げた detail を読む口（smoke 用。読むだけで、何も動かさない） */
+#define PROC_LAST_EVENT "void stinger_last_event(out string json)"
 
 #define DURATION_MIN_MS 100
 #define DURATION_MAX_MS 20000
 #define DURATION_DEFAULT_MS 1500
 #define POINT_DEFAULT_MS 750
 
+/* 測った長さをそのまま信じる範囲。外れたら行き先の duration_ms を使う */
+#define MEASURED_MIN_MS 50.0
+#define MEASURED_MAX_MS 60000.0
+/* 「開始からの経過 / t」と「フレーム間 / t の伸び」の食い違いをどこまで許すか。
+ * 時間で動いていれば 2 つは誤差（µs）しか違わない。T バーはまず合わない */
+#define MEASURE_TOLERANCE 0.05
+/* t がほぼ 0 のまま、これだけ経っても動かなければ待つのをやめる（T バーを
+ * 止めたまま・とても長い期間）。ページを待たせ続けない */
+#define MEASURE_GIVE_UP_NS 500000000ULL
+
+/* 行き先ごとの設定は多くても数十。受け取りすぎない（1 つの JSON で OBS を重くしない） */
+#define SCENES_MAX 256
+/* uuid は 36 文字 */
+#define UUID_BUF 40
+
+struct scene_timing {
+	char uuid[UUID_BUF]; /* 既定の値では空 */
+	uint32_t duration_ms;
+	uint32_t point_ms;
+};
+
 struct stinger {
 	obs_source_t *source;
 	obs_source_t *browser; /* 強い参照。作ったときから消えるまで持つ */
 
 	char *url;
-	uint32_t duration_ms;
-	uint32_t point_ms;
 	uint32_t width;
 	uint32_t height;
 
-	float point; /* 切り替え点（0..1。duration に対する比） */
+	/* ここから下（描画と音が読む末尾の値を除く）は mutex の下で触る。
+	 * 設定は obs-websocket のスレッド、開始は UI のスレッド、決めるのは描画の
+	 * スレッドから来る */
+	pthread_mutex_t mutex;
+	struct scene_timing fallback; /* scenes に無い行き先に使う */
+	DARRAY(struct scene_timing) scenes;
+
+	/* 1 回の切り替えぶん（transition_start で空にする） */
+	uint64_t start_ns;      /* libobs と同じ時計（os_gettime_ns）で控えた開始 */
+	uint64_t prev_start_ns; /* 1 つ前の開始。libobs が開始時刻を引き継いだとき用 */
+	bool was_active;        /* 切り替えの途中でまた切り替えられた */
+	obs_source_t *old_a;    /* そのときの A / B。比べるだけで参照は持たない */
+	obs_source_t *old_b;
+	bool armed;    /* 行き先が決まった（シグナルが来た） */
+	bool resolved; /* 行き先の設定を選んだ */
+	bool sent;     /* ページへ投げた */
+	char dest_uuid[UUID_BUF];
+	struct scene_timing entry; /* 選んだ設定 */
+	bool sampled;              /* 長さを測るための 1 つ目のフレームを見た */
+	uint64_t sample_ns;
+	float sample_t;
+	struct dstr last_event; /* 最後にページへ投げた detail */
+
+	/* 描画と音のスレッドが読む。決めるのは上の mutex の下 */
+	volatile bool render_b_ok; /* 行き先を選び終えた（それまでは A を描く） */
+	float point;               /* 切り替え点（0..1。OBS の長さに対する比） */
 	float a_mul;
 	float b_mul;
 	bool transitioning;
@@ -92,6 +173,58 @@ static uint32_t clamp_u32(long long v, uint32_t lo, uint32_t hi)
 	if (v > (long long)hi)
 		return hi;
 	return (uint32_t)v;
+}
+
+/* 1 件ぶんの長さと切り替え点を読む（範囲の外は丸める） */
+static void read_timing(obs_data_t *d, struct scene_timing *out)
+{
+	out->duration_ms = clamp_u32(obs_data_get_int(d, "duration_ms"), DURATION_MIN_MS, DURATION_MAX_MS);
+	out->point_ms = clamp_u32(obs_data_get_int(d, "point_ms"), 0, out->duration_ms);
+}
+
+/* 切り替え点の比。0 と 1 ちょうどにすると、A か B が 1 フレームも出ないまま
+ * 音のフェードが 0 で割ることになるので、端を少し残す */
+static float timing_ratio(const struct scene_timing *t)
+{
+	float point = t->duration_ms ? (float)t->point_ms / (float)t->duration_ms : 0.5f;
+	if (point > 0.999f)
+		point = 0.999f;
+	else if (point < 0.001f)
+		point = 0.001f;
+	return point;
+}
+
+/* 受け取った scenes を、形の揃った新しい配列にして返す（呼んだ側が release）。
+ * uuid の無いもの・同じ uuid の 2 つ目は落とす。settings どうしで配列を
+ * 共有しないよう、毎回作り直す */
+static obs_data_array_t *copy_scenes(obs_data_array_t *in)
+{
+	obs_data_array_t *out = obs_data_array_create();
+	const size_t n = in ? obs_data_array_count(in) : 0;
+	size_t kept = 0;
+	for (size_t i = 0; i < n && kept < SCENES_MAX; i++) {
+		obs_data_t *item = obs_data_array_item(in, i);
+		const char *uuid = item ? obs_data_get_string(item, "uuid") : NULL;
+		bool dup = false;
+		for (size_t j = 0; uuid && *uuid && j < kept && !dup; j++) {
+			obs_data_t *prev = obs_data_array_item(out, j);
+			dup = strcmp(obs_data_get_string(prev, "uuid"), uuid) == 0;
+			obs_data_release(prev);
+		}
+		if (uuid && *uuid && strlen(uuid) < UUID_BUF && !dup) {
+			struct scene_timing t;
+			read_timing(item, &t);
+			obs_data_t *o = obs_data_create();
+			obs_data_set_string(o, "uuid", uuid);
+			obs_data_set_int(o, "duration_ms", t.duration_ms);
+			obs_data_set_int(o, "point_ms", t.point_ms);
+			obs_data_array_push_back(out, o);
+			obs_data_release(o);
+			kept++;
+		}
+		obs_data_release(item);
+	}
+	return out;
 }
 
 /* ブラウザソースへ渡す設定。大きさは配信画面（キャンバス）そのもの */
@@ -147,16 +280,48 @@ static void sync_browser(struct stinger *s)
 	obs_data_release(bs);
 }
 
+/* 切り替え点を決める（描画と音が読む値） */
+static void set_point(struct stinger *s, float point)
+{
+	s->point = point;
+	s->a_mul = 1.0f / point;
+	s->b_mul = 1.0f / (1.0f - point);
+}
+
 static void stinger_update(void *data, obs_data_t *settings)
 {
 	struct stinger *s = data;
 
 	bfree(s->url);
 	s->url = bstrdup(obs_data_get_string(settings, "url"));
-	s->duration_ms = clamp_u32(obs_data_get_int(settings, "duration_ms"), DURATION_MIN_MS, DURATION_MAX_MS);
-	s->point_ms = clamp_u32(obs_data_get_int(settings, "point_ms"), 0, s->duration_ms);
 
-	obs_transition_enable_fixed(s->source, true, s->duration_ms);
+	struct scene_timing fallback = {0};
+	read_timing(settings, &fallback);
+
+	/* 行き先ごとの設定。読み直すたびに作り直し、入れ替えだけを mutex の下でやる */
+	DARRAY(struct scene_timing) scenes;
+	da_init(scenes);
+	obs_data_array_t *arr = obs_data_get_array(settings, "scenes");
+	const size_t n = arr ? obs_data_array_count(arr) : 0;
+	for (size_t i = 0; i < n && scenes.num < SCENES_MAX; i++) {
+		obs_data_t *item = obs_data_array_item(arr, i);
+		const char *uuid = obs_data_get_string(item, "uuid");
+		if (uuid && *uuid && strlen(uuid) < UUID_BUF) {
+			struct scene_timing t = {0};
+			strcpy(t.uuid, uuid);
+			read_timing(item, &t);
+			da_push_back(scenes, &t);
+		}
+		obs_data_release(item);
+	}
+	obs_data_array_release(arr);
+
+	pthread_mutex_lock(&s->mutex);
+	s->fallback = fallback;
+	da_move(s->scenes, scenes);
+	pthread_mutex_unlock(&s->mutex);
+	da_free(scenes);
+
 	sync_browser(s);
 }
 
@@ -167,32 +332,85 @@ static void stinger_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "point_ms", POINT_DEFAULT_MS);
 }
 
-/* 設定を上書きする。settings は来たぶんだけ（url / duration_ms / point_ms） */
-static void apply_config(struct stinger *s, obs_data_t *config)
+/* config（url / duration_ms / point_ms / scenes）を settings へ写す */
+static void copy_config(obs_data_t *settings, obs_data_t *config)
 {
-	obs_data_t *settings = obs_source_get_settings(s->source);
 	obs_data_set_string(settings, "url", obs_data_get_string(config, "url"));
 	obs_data_set_int(settings, "duration_ms", obs_data_get_int(config, "duration_ms"));
 	obs_data_set_int(settings, "point_ms", obs_data_get_int(config, "point_ms"));
+	obs_data_array_t *in = obs_data_get_array(config, "scenes");
+	obs_data_array_t *scenes = copy_scenes(in);
+	obs_data_set_array(settings, "scenes", scenes);
+	obs_data_array_release(scenes);
+	obs_data_array_release(in);
+}
+
+/* 設定を上書きする */
+static void apply_config(struct stinger *s, obs_data_t *config)
+{
+	obs_data_t *settings = obs_source_get_settings(s->source);
+	copy_config(settings, config);
 	obs_source_update(s->source, settings);
 	obs_data_release(settings);
+}
+
+/* 自分の "transition_start" シグナル。libobs が B（行き先）を決めたあとに、
+ * obs_transition_start を呼んだスレッドから出す。ここで行き先を控えるだけにして、
+ * 選ぶのは描画のスレッド（stinger_video_tick）でやる */
+static void on_transition_signal(void *data, calldata_t *cd)
+{
+	UNUSED_PARAMETER(cd);
+	struct stinger *s = data;
+	obs_source_t *b = obs_transition_get_source(s->source, OBS_TRANSITION_SOURCE_B);
+
+	pthread_mutex_lock(&s->mutex);
+	const char *uuid = b ? obs_source_get_uuid(b) : NULL;
+	if (uuid && strlen(uuid) < UUID_BUF)
+		strcpy(s->dest_uuid, uuid);
+	else
+		s->dest_uuid[0] = '\0';
+	/* 切り替えの途中で、いまの A か B へまた切り替えられたとき、libobs は
+	 * 開始時刻を置き直さない（obs_transition_start の active && same_as_*）。
+	 * 長さを測る起点もそちらに合わせる */
+	if (s->was_active && b && (b == s->old_a || b == s->old_b))
+		s->start_ns = s->prev_start_ns;
+	s->armed = true;
+	pthread_mutex_unlock(&s->mutex);
+
+	obs_source_release(b);
+}
+
+/* 最後にページへ投げた detail（smoke から読む。読むだけ） */
+static void proc_last_event(void *data, calldata_t *cd)
+{
+	struct stinger *s = data;
+	pthread_mutex_lock(&s->mutex);
+	calldata_set_string(cd, "json", s->last_event.array ? s->last_event.array : "");
+	pthread_mutex_unlock(&s->mutex);
 }
 
 static void *stinger_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct stinger *s = bzalloc(sizeof(*s));
 	s->source = source;
+	pthread_mutex_init(&s->mutex, NULL);
+	da_init(s->scenes);
+	set_point(s, 0.5f);
+
+	/* 長さは OBS（「期間」欄とシーンごとの上書き）に任せる。冒頭の説明のとおり、
+	 * 行き先ごとに固定の長さを切り替える隙が libobs に無いため */
+	obs_transition_enable_fixed(source, false, 0);
+
+	signal_handler_connect(obs_source_get_signal_handler(source), "transition_start", on_transition_signal, s);
+	proc_handler_add(obs_source_get_proc_handler(source), PROC_LAST_EVENT, proc_last_event, s);
 
 	/* OBS の ＋ から作ったばかり（まだ URL を持っていない）なら、本体が最後に
 	 * 配った設定をそのまま使う。シーンコレクションから読み直したものは自分の
 	 * 設定を持っているので、そちらを優先する */
 	pthread_mutex_lock(&G.mutex);
 	const char *url = obs_data_get_string(settings, "url");
-	if ((!url || !*url) && G.last_config) {
-		obs_data_set_string(settings, "url", obs_data_get_string(G.last_config, "url"));
-		obs_data_set_int(settings, "duration_ms", obs_data_get_int(G.last_config, "duration_ms"));
-		obs_data_set_int(settings, "point_ms", obs_data_get_int(G.last_config, "point_ms"));
-	}
+	if ((!url || !*url) && G.last_config)
+		copy_config(settings, G.last_config);
 	da_push_back(G.list, &s);
 	pthread_mutex_unlock(&G.mutex);
 
@@ -208,12 +426,107 @@ static void stinger_destroy(void *data)
 	da_erase_item(G.list, &s);
 	pthread_mutex_unlock(&G.mutex);
 
+	signal_handler_disconnect(obs_source_get_signal_handler(s->source), "transition_start", on_transition_signal,
+				  s);
 	if (s->browser) {
 		obs_source_dec_showing(s->browser);
 		obs_source_release(s->browser);
 	}
+	da_free(s->scenes);
+	dstr_free(&s->last_event);
+	pthread_mutex_destroy(&s->mutex);
 	bfree(s->url);
 	bfree(s);
+}
+
+/* OBS の実際の長さを測る。決まれば true（*out_ms に入れる）。まだ見るべき
+ * フレームが要るなら false。測れない・信じられないときは行き先の duration_ms。
+ * mutex の下で呼ぶ */
+static bool measure_duration(struct stinger *s, uint64_t now, float t, uint32_t *out_ms)
+{
+	const uint32_t fallback = s->entry.duration_ms;
+	const uint64_t since = now > s->start_ns ? now - s->start_ns : 0;
+
+	/* もう終わりきっている（t が 1 に張り付く）なら、割っても長さにならない */
+	if (t >= 0.999f) {
+		*out_ms = fallback;
+		return true;
+	}
+	if (t <= 0.0001f) {
+		if (since < MEASURE_GIVE_UP_NS)
+			return false;
+		*out_ms = fallback;
+		return true;
+	}
+	if (!s->sampled) {
+		s->sampled = true;
+		s->sample_ns = now;
+		s->sample_t = t;
+		return false;
+	}
+	if (now <= s->sample_ns)
+		return false;
+
+	const double dt = (double)t - (double)s->sample_t;
+	const double by_start = (double)since / 1e6 / (double)t;
+	const double by_rate = dt > 0.0 ? (double)(now - s->sample_ns) / 1e6 / dt : -1.0;
+	if (by_rate <= 0.0 || fabs(by_rate - by_start) > by_start * MEASURE_TOLERANCE || by_start < MEASURED_MIN_MS ||
+	    by_start > MEASURED_MAX_MS) {
+		*out_ms = fallback;
+		return true;
+	}
+	*out_ms = (uint32_t)(by_start + 0.5);
+	return true;
+}
+
+/* 行き先を選び、長さを測り、ページへ投げる（冒頭の 1〜3）。
+ * 描画のスレッドだが graphics の文脈の外なので、proc_handler を呼んでよい */
+static void stinger_video_tick(void *data, float seconds)
+{
+	UNUSED_PARAMETER(seconds);
+	struct stinger *s = data;
+	if (!s->transitioning)
+		return;
+
+	struct dstr json = {0};
+	pthread_mutex_lock(&s->mutex);
+	if (s->armed && !s->resolved) {
+		s->entry = s->fallback;
+		s->entry.uuid[0] = '\0';
+		for (size_t i = 0; s->dest_uuid[0] && i < s->scenes.num; i++) {
+			if (strcmp(s->scenes.array[i].uuid, s->dest_uuid) == 0) {
+				s->entry = s->scenes.array[i];
+				break;
+			}
+		}
+		set_point(s, timing_ratio(&s->entry));
+		s->resolved = true;
+		s->render_b_ok = true;
+	}
+	if (s->resolved && !s->sent) {
+		const float t = obs_transition_get_time(s->source);
+		uint32_t duration_ms;
+		if (measure_duration(s, obs_get_video_frame_time(), t, &duration_ms)) {
+			const double tt = t < 0.0f ? 0.0 : (t > 1.0f ? 1.0 : (double)t);
+			const uint32_t point_ms = (uint32_t)((double)duration_ms * (double)s->point + 0.5);
+			const uint32_t elapsed_ms = (uint32_t)((double)duration_ms * tt + 0.5);
+			dstr_printf(&s->last_event,
+				    "{\"durationMs\":%u,\"pointMs\":%u,\"sceneUuid\":\"%s\",\"elapsedMs\":%u}",
+				    duration_ms, point_ms, s->dest_uuid, elapsed_ms);
+			dstr_copy_dstr(&json, &s->last_event);
+			s->sent = true;
+		}
+	}
+	pthread_mutex_unlock(&s->mutex);
+
+	if (json.array && s->browser) {
+		calldata_t cd = {0};
+		calldata_set_string(&cd, "eventName", EVENT_PLAY);
+		calldata_set_string(&cd, "jsonString", json.array);
+		proc_handler_call(obs_source_get_proc_handler(s->browser), "javascript_event", &cd);
+		calldata_free(&cd);
+	}
+	dstr_free(&json);
 }
 
 static void stinger_video_render(void *data, gs_effect_t *effect)
@@ -221,8 +534,10 @@ static void stinger_video_render(void *data, gs_effect_t *effect)
 	UNUSED_PARAMETER(effect);
 	struct stinger *s = data;
 
+	/* t は OBS の長さに対する 0..1。行き先を選ぶまでは B を知らないので A のまま */
 	float t = obs_transition_get_time(s->source);
-	enum obs_transition_target target = t < s->point ? OBS_TRANSITION_SOURCE_A : OBS_TRANSITION_SOURCE_B;
+	enum obs_transition_target target = (!s->render_b_ok || t < s->point) ? OBS_TRANSITION_SOURCE_A
+									      : OBS_TRANSITION_SOURCE_B;
 	if (!obs_transition_video_render_direct(s->source, target))
 		return;
 
@@ -245,7 +560,8 @@ static void stinger_video_render(void *data, gs_effect_t *effect)
 }
 
 /* 音: 切り替え点までに A を絞り、切り替え点から B を上げる（標準のスティンガーの
- * 「フェードアウト→フェードイン」と同じ）。ページの音はその上に足す */
+ * 「フェードアウト→フェードイン」と同じ）。t も切り替え点も OBS の長さに対する比。
+ * ページの音はその上に足す */
 static inline float calc_fade(float t, float mul)
 {
 	t *= mul;
@@ -296,21 +612,6 @@ static bool stinger_audio_render(void *data, uint64_t *ts_out, struct obs_source
 	return true;
 }
 
-static void play_page(struct stinger *s)
-{
-	if (!s->browser)
-		return;
-	struct dstr json = {0};
-	dstr_printf(&json, "{\"durationMs\":%u,\"pointMs\":%u}", s->duration_ms, s->point_ms);
-
-	calldata_t cd = {0};
-	calldata_set_string(&cd, "eventName", EVENT_PLAY);
-	calldata_set_string(&cd, "jsonString", json.array);
-	proc_handler_call(obs_source_get_proc_handler(s->browser), "javascript_event", &cd);
-	calldata_free(&cd);
-	dstr_free(&json);
-}
-
 static void stinger_transition_start(void *data)
 {
 	struct stinger *s = data;
@@ -321,20 +622,37 @@ static void stinger_transition_start(void *data)
 	if (cx != s->width || cy != s->height)
 		sync_browser(s);
 
-	float point = s->duration_ms ? (float)s->point_ms / (float)s->duration_ms : 0.5f;
-	if (point > 0.999f)
-		point = 0.999f;
-	else if (point < 0.001f)
-		point = 0.001f;
-	s->point = point;
-	s->a_mul = 1.0f / point;
-	s->b_mul = 1.0f / (1.0f - point);
+	/* ここではまだ B が次の行き先になっていない（libobs はこのあとで置く）。
+	 * いまの A / B は、開始時刻を libobs が置き直すかの見分けにだけ使う */
+	obs_source_t *a = obs_transition_get_source(s->source, OBS_TRANSITION_SOURCE_A);
+	obs_source_t *b = obs_transition_get_source(s->source, OBS_TRANSITION_SOURCE_B);
 
-	/* 切り替えの途中でまた切り替えられたら、頭から流し直す（標準のスティンガーと同じ） */
+	pthread_mutex_lock(&s->mutex);
+	s->was_active = s->transitioning;
+	s->old_a = a;
+	s->old_b = b;
+	s->prev_start_ns = s->start_ns;
+	/* libobs が開始時刻を取るのと同じ時計（obs_transition_start の os_gettime_ns）。
+	 * 向こうはこの呼び出しから戻った直後に取るので、差は µs */
+	s->start_ns = os_gettime_ns();
+	s->armed = false;
+	s->resolved = false;
+	s->sent = false;
+	s->sampled = false;
+	s->dest_uuid[0] = '\0';
+	s->render_b_ok = false;
+	/* 行き先を選ぶまでの音は既定の切り替え点で絞り始める（1〜2 フレームぶん） */
+	set_point(s, timing_ratio(&s->fallback));
+	pthread_mutex_unlock(&s->mutex);
+
+	obs_source_release(a);
+	obs_source_release(b);
+
+	/* 切り替えの途中でまた切り替えられたら、頭から決め直して流し直す（標準の
+	 * スティンガーと同じ）。ページへ投げるのは行き先が決まってから（video_tick） */
 	if (!s->transitioning && s->browser)
 		obs_source_add_active_child(s->source, s->browser);
 	s->transitioning = true;
-	play_page(s);
 }
 
 static void stinger_transition_stop(void *data)
@@ -388,6 +706,7 @@ struct obs_source_info stinger_transition_info = {
 	.update = stinger_update,
 	.get_defaults = stinger_defaults,
 	.get_properties = stinger_properties,
+	.video_tick = stinger_video_tick,
 	.video_render = stinger_video_render,
 	.audio_render = stinger_audio_render,
 	.enum_active_sources = stinger_enum_active_sources,
@@ -402,6 +721,7 @@ struct obs_source_info stinger_transition_info = {
 static void req_configure(obs_data_t *req, obs_data_t *res, void *priv)
 {
 	UNUSED_PARAMETER(priv);
+	obs_data_set_bool(res, "per_scene", true);
 	if (!req) {
 		obs_data_set_int(res, "count", 0);
 		return;
@@ -415,6 +735,12 @@ static void req_configure(obs_data_t *req, obs_data_t *res, void *priv)
 	obs_data_set_int(config, "point_ms",
 			 obs_data_has_user_value(req, "point_ms") ? obs_data_get_int(req, "point_ms")
 								  : POINT_DEFAULT_MS);
+	/* 無ければ空。前に配った行き先ごとの設定を残さない（本体が外したものが残る） */
+	obs_data_array_t *in = obs_data_get_array(req, "scenes");
+	obs_data_array_t *scenes = copy_scenes(in);
+	obs_data_set_array(config, "scenes", scenes);
+	obs_data_array_release(scenes);
+	obs_data_array_release(in);
 
 	/* 名簿の中の source は、ここで参照を取ってから mutex を離して触る
 	 * （obs_source_update の中で destroy が走ると、同じ mutex を取りに来る） */
