@@ -3,9 +3,10 @@
 [StreamSpook](https://streamspook.app) が OBS の中で受け持つぶん ―― 配信画面そのものに掛けるポストエフェクトや、OBS の中を流れる音など、ブラウザソースのオーバーレイでは届かないもの ―― のネイティブプラグイン。モジュール名は `stream-spook`、土台は [obs-plugintemplate](https://github.com/obsproject/obs-plugintemplate)。
 
 - **ライセンス: GPL-2.0-or-later**（[LICENSE](./LICENSE)）。libobs が GPL-2.0-or-later で、そのヘッダのコード（マクロ・`static inline`）がこの DLL に直接含まれるため。StreamSpook 本体とは別のプログラムで、話すのは obs-websocket の JSON だけ
-- **公開しているのは [Fortyworks/stream-spook-obs-plugin](https://github.com/Fortyworks/stream-spook-obs-plugin)。** リリースごとのスナップショット（1 版 = 1 コミット）で、開発の履歴と PR は入っていない。開発は非公開のリポジトリで行い、タグを打つと Actions がミラーへ積む（「7. 公開リポジトリ（ミラー）」）
+- **公開しているのは [Fortyworks/stream-spook-obs-plugin](https://github.com/Fortyworks/stream-spook-obs-plugin)。** リリースごとのスナップショット（1 版 = 1 コミット）で、開発の履歴と PR は入っていない。開発は非公開のリポジトリで行い、タグを打つと Actions がミラーへ積む（「8. 公開リポジトリ（ミラー）」）
 - **いま入っているもの:** ポストエフェクト 8 種（古い映画 / 黒澤モード / モザイク / ビネット / グリッチ / 色収差 / カラーグレーディング / レンズのゆがみ）と、オーディオビジュアライザー用の音の取り口（トラックのミックス / ソース 1 つ。「3. オーディオビジュアライザー」）、シーントランジション「StreamSpook: スティンガー」（「4. スティンガー」）
 - **配り方:** Release の zip を StreamSpook 本体が同梱し、アプリの「OBS プラグイン」ページから OBS のユーザー用プラグインフォルダへ入れる。手で入れることもできる（下）
+- **Streamlabs Desktop にも同じ DLL のまま入る。** フィルタと音の取り口はそのまま動き、スティンガーだけ登録しない。obs-websocket が無いので、話すのは自前の名前付きパイプ（「5. Streamlabs Desktop」）
 
 ## 1. ビルド（Windows）
 
@@ -37,6 +38,7 @@ cmake --install build_x64 --config RelWithDebInfo --prefix "$env:ProgramData\obs
 
 - OBS が起動中だと DLL の上書きに失敗する（初回の新規コピーは通る）
 - ポータブルモードの OBS は `ProgramData` を見ないので、この置き場所では読まれない
+- Streamlabs Desktop は置き場所が違う（「5. Streamlabs Desktop」）
 
 ### OBS を起動せずに確かめる（smoke）
 
@@ -47,6 +49,14 @@ pwsh tools/smoke/Run-Smoke.ps1
 `.deps` の OBS ソースから `libobs-d3d11` を組み、プラグインを libobs に読み込んで全フィルタを作り（＝ `.effect` を実際にコンパイルし）、2 色のソースに掛けてピクセルを読み戻す（座標をずらすものは境目の色が動くこと、樽型のゆがみは角が透明になることまで見る）。終了コード 0 で OK。シェーダーのエラーは `[obs 300]` 以下の行に出る。`.effect` を触ったら必ず回す。
 
 オーディオビジュアライザー（`src/spectrum.c`）も同じ smoke が見る。obs-websocket は読み込まないので、vendor API の偽物（中身は proc_handler の呼び出しだけ）を先に置いてから、1kHz の正弦波を出すソースを購読し、イベントの帯が正しい位置に立つこと・`unsubscribe` で消えること・期限（6 秒）が切れると止まること・消したソースは受けないことを見る。スティンガー（`src/stinger-transition.c`）は、OBS の画面と同じく private のソースとして作り、`stinger_configure` で設定（行き先ごとの `scenes` を含む）が届いて保存されること・読み直したものは上書きしないこと・長さを固定していないこと・OBS の長さ（1500ms）で回したとき、行き先ごとの設定がある行き先はその切り替え点で、無い行き先は既定の切り替え点で A / B が替わること・ページへ投げる detail（OBS の長さを測った `durationMs`、行き先の比の `pointMs`、`sceneUuid`、`elapsedMs`）・T バー（手動）では行き先の `duration_ms` を使うことを見る（obs-browser は読み込まないので、ページの絵そのものはここでは出ない。detail はスティンガーの proc `stinger_last_event` から読む。読むだけの口）。帯の計算そのもの（`spectrum-analyzer.c`）は libobs 無しの `spectrum-analyzer-test`（CMake の target。配布物には入らない）が先に回る。CI でも回る。
+
+音量メーター（`src/meters.c`）と、どこに読み込まれたか（`host_info`）も同じ smoke が見る。0.5 の正弦波で peak がおよそ 0.5 になること・購読を外すと消えることまで。
+
+```powershell
+pwsh tools/smoke/Run-Smoke.ps1 -Streamlabs
+```
+
+`-Streamlabs` を付けると、**同じ DLL を Streamlabs Desktop の libobs（独自のフォーク）に読み込んで**回す。Streamlabs が配っている libobs 一式（ヘッダ・`obs.lib`・DLL）を `tools/smoke/streamlabs.json` の版と sha256 で `.deps` に落とし（約 155MB、初回だけ）、smoke.exe だけをフォークのヘッダで組み直す。プラグインは組み直さない（配る DLL 1 つで両方に入る、を確かめるのが目的）。フィルタ・音の取り口・音量メーターに加えて、スティンガーを登録していないこと、パイプにつないで要求とイベントが通ること、切ってつなぎ直せることを見る。Streamlabs が libobs を上げたら `streamlabs.json` を上げて回す（版は obs-studio-node の `.github/workflows/main.yml` の `LibOBSVersion`）。
 
 ### 文言の見張り
 
@@ -208,6 +218,7 @@ StreamSpook 本体のカスタムオーバーレイにあるビジュアライ�
 - **帯の切り方は本体の PC 音の経路と同じ**（2048 点・64 帯・30Hz〜16kHz の対数・底 -70dB・+2.5dB/oct の持ち上げ）。切り替えても同じ曲で棒の高さが変わらないようにするため。値を変えるときは本体の `src-tauri/src/spectrum.rs` と対で直す
 - **無音は 1 回だけ流す。** 全部 0 の配列を送り続けない。音が来ないまま止まっている取り口は 120ms で 0 を詰めて落とす
 - **誰も見ていないときは動かない。** 期限が切れた取り口は畳み、取り口が 1 つも無いあいだスレッドは 100ms おきに起きて何もしない
+- **Streamlabs Desktop では同じ要求とイベントが名前付きパイプを通る**（「5. Streamlabs Desktop」）
 - **`obs-websocket-api.h` は obs-websocket のリポジトリから写したもの**（GPL-2.0-or-later、`src/obs-websocket-api.h`）。リンクは要らない（proc_handler を引くだけ）。obs-websocket が無ければ `obs_websocket_register_vendor` が NULL を返すので、フィルタだけで動く
 
 ## 4. スティンガー（シーントランジション）
@@ -237,8 +248,65 @@ StreamSpook 本体のカスタムオーバーレイにあるビジュアライ�
 | ページへのイベント | `streamspook:stinger` | detail は `{ durationMs, pointMs, sceneUuid, elapsedMs }`。`durationMs` は OBS の実際の長さ（測れないときは行き先の `duration_ms`）、`pointMs` はそれに切り替え点の比を掛けたもの、`sceneUuid` は行き先のシーンの uuid（`scenes` に無くても入る。行き先が無いときは空）、`elapsedMs` は投げた時点で OBS の切り替えが進んでいる量（行き先を決めて長さを測るのに 1〜2 フレーム掛かるので、ページはそのぶん先へ送って OBS と揃える）。切り替えの途中でまた切り替えられたら、決め直してもう一度投げる |
 
 - **vendor は 1 本（`src/vendor.c`）。** 同じ名前の vendor は 1 度しか登録できないので、音の取り口とスティンガーが同じ 1 本に要求を足す
+- **Streamlabs Desktop では登録しない**（「5. Streamlabs Desktop」）
 
-## 5. つくり
+## 5. Streamlabs Desktop
+
+Streamlabs Desktop は libobs を独自にフォークして使っている（obs-studio-node。いまは `32.1.1sl12`）。このプラグインは**同じ DLL のまま**そちらにも入る。
+
+| もの | Streamlabs Desktop で |
+|---|---|
+| フィルタ 9 種 | そのまま動く |
+| 音の取り口（`spectrum_*`） | そのまま動く（パイプ経由） |
+| 音量メーター（`meters_*`） | Streamlabs のためにある（下） |
+| スティンガー | **登録しない** |
+
+### 置き場所
+
+Streamlabs Desktop がユーザーのプラグインを読むのは `%APPDATA%\slobs-plugins\` の下だけ（`app/services/obs-user-plugins.ts` が起動時にフォルダを作り、obs-studio-node の `addModulePaths()` が読む）。OBS の `%ProgramData%\obs-studio\plugins` は読まない。並びも OBS と違う:
+
+| もの | 置き場所 |
+|---|---|
+| DLL | `%APPDATA%\slobs-plugins\obs-plugins\64bit\stream-spook.dll` |
+| データ（effect / locale） | `%APPDATA%\slobs-plugins\data\obs-plugins\stream-spook\` |
+
+Streamlabs を再起動すると読まれる。Mac 版は同梱のプラグインしか読まないので対象外。Streamlabs の画面のフィルタ一覧は許可リストなので、**ここのフィルタは Streamlabs の画面には出ない**（アプリから付ける）。
+
+### スティンガーを登録しない理由
+
+フォークは `obs_source_info` の `audio_render` の直後に `audio_render_do` を 1 つ挿し込んでいて、OBS の SDK で組んだこの DLL とは、それより後ろの項目が 1 つずつずれる。フィルタが使う項目は全部それより前なので影響しないが、スティンガーは後ろの `enum_all_sources` / `transition_start` / `transition_stop` / `video_get_color_space` を使うので、別の関数として呼ばれて**作った瞬間に落ちる**（`obs_video_info` も頭に項目が足されていて、`obs_get_video_info` が受け皿の外まで書く）。Streamlabs の画面はプラグインのトランジションを選ばせもしないので、登録しない。
+
+見分け方は `src/host.c`。フォークにしか無い関数（`obs_get_video_info_count`）が `obs.dll` から引けるかで見る（版の文字列は作り方しだいで変わるので当てにしない）。**フォークの構造体の並びが変わったら、ここに書いたことを見直す。** smoke の `-Streamlabs` が落ちるのがその合図。
+
+### 話し方（名前付きパイプ）
+
+Streamlabs Desktop には obs-websocket が入っていないので、**Streamlabs で読み込まれたときだけ**自前の口 `\\.\pipe\stream-spook` を開く（`src/pipe.c`）。OBS Studio では開かない（obs-websocket の 1 本で足りるので、通信路を増やさない）。要求とイベントは vendor と同じもので、各機能は口を意識しない（`src/vendor.c` が開いている口の全部に配る）。
+
+1 行 1 つの JSON（UTF-8、改行で区切る）:
+
+| 向き | 形 |
+|---|---|
+| 要求 | `{ "id": 1, "type": "meters_subscribe", "data": { … } }` |
+| 応答 | `{ "id": 1, "data": { … } }`。知らない要求は `{ "id": 1, "error": "unknown_request" }` |
+| イベント | `{ "event": "meters", "data": { … } }` |
+
+- この PC の中からだけつなげる（`PIPE_REJECT_REMOTE_CLIENTS`）。同時に 4 本まで
+- 読まずに溜めているつなぎ手は、書き込みが 250ms 詰まった時点で切る（音の受け取りを止めない）
+- 1 行が 1MB を超えたら壊れた入力として切る
+
+### 要求の一覧（どちらの口でも同じ）
+
+| 種類 | 名前 | 中身 |
+|---|---|---|
+| 要求 | `host_info` | → `{ version, host: "obs" \| "streamlabs", libobs, features: { stinger, meters, spectrum } }`。アプリはつないだら最初にこれを聞いて、使えないもの（Streamlabs のスティンガー）を出さない |
+| 要求 | `meters_subscribe` | `{ keys: [{ key: "input-<uuid>" }] }` → `{ active, rejected }`。鍵と期限（6 秒）の扱いは `spectrum_subscribe` と同じ |
+| 要求 | `meters_unsubscribe` | `{ keys: [{ key }] }` → `{}` |
+| イベント | `meters` | `{ inputs: [{ k, levels: [{ m, p, i }] }] }`。毎秒 20 回（obs-websocket の `InputVolumeMeters` と同じ 50ms おき）。`levels` はチャンネルごと、値は倍率（0..1）で、`m` = magnitude（RMS）・`p` = peak・`i` = フェーダーを通る前の peak。新しい値が届いた取り口だけを載せる |
+
+- **音量メーターは Streamlabs のためにある。** OBS Studio では obs-websocket の `InputVolumeMeters` が同じものを流すので、本体はそちらを使う（要求は OBS でも登録されるが、呼ばれない）。Streamlabs Desktop の API には音量を外へ出す口が無く、音量ミキサーの提案・自動調整、マイク調整の計測、無言アラートがこれを読む
+- **取り方は libobs の volmeter**（OBS のミキサーの棒と同じもの。`OBS_FADER_LOG`）。ソースの一覧は `spectrum_sources` を使う。Streamlabs のソース ID は libobs のソース名そのもの（`InputFactory.create(type, id, …)`）なので、本体は名前で突き合わせられる
+
+## 6. つくり
 
 ```
 buildspec.json        名前・版・依存の版（版を上げるのはここだけ。Release のタグと一致させる）
@@ -254,7 +322,10 @@ src/
   spectrum.{h,c}      オーディオビジュアライザー用の音の取り口（vendor API・購読・期限）
   spectrum-analyzer.{h,c}  帯の計算（libobs に依存しない。単体で確かめられる）
   stinger-transition.{h,c} シーントランジション「スティンガー」（ブラウザソースを重ねる）
-  vendor.{h,c}        obs-websocket の vendor（stream-spook）を 1 本だけ登録する
+  meters.{h,c}        音量メーター（Streamlabs Desktop 向け。vendor の要求・購読・期限）
+  host.{h,c}          読み込まれた先が OBS か Streamlabs Desktop かを見分ける
+  vendor.{h,c}        アプリと話す口をまとめる（obs-websocket の vendor と、Streamlabs ではパイプ）
+  pipe.{h,c}          Streamlabs Desktop で開く名前付きパイプ（\\.\pipe\stream-spook）
   obs-websocket-api.h obs-websocket の vendor API（向こうのリポジトリの写し）
 data/
   effects/*.effect    描き方そのもの（HLSL 風の OBS effect）
@@ -262,7 +333,7 @@ data/
 tools/
   package.mjs         配布物（release/ と zip）を作る
   check-locale.mjs    文言の突き合わせ
-  smoke/              OBS を起動せずに読み込んで確かめる道具（analyzer-test.c は帯の計算だけを見る）
+  smoke/              OBS を起動せずに読み込んで確かめる道具（analyzer-test.c は帯の計算だけを見る。streamlabs.json は -Streamlabs で読み込む libobs の版）
 ```
 
 決めごと:
@@ -279,7 +350,7 @@ tools/
 - **音は取るだけで、描かない。** 帯の強さを出すところまでがここの仕事で、棒の描き方・追従・色は本体のオーバーレイが持つ。鍵の形（`track-<n>` / `input-<uuid>`）とイベントの形は一度決めたら変えない（本体が名指しで叩く）
 - **秘密にしたいものを置かない。** このリポジトリは GPL で全部公開される。独自のロジックは StreamSpook 本体に置き、ここは「OBS の中でしかできないこと」を薄く受け持つ。本体のコードをここへ写さない（GPL になる）し、ここのコードを本体へ写さない（本体が GPL の派生物になる）
 
-## 6. リリース
+## 7. リリース
 
 1. `buildspec.json` の `version` を上げてコミット
 2. 同じ番号のタグを打つ: `git tag v0.2.0 && git push origin v0.2.0`
@@ -288,7 +359,7 @@ tools/
 
 `manifest.json`（`{ "version": "…" }`）と `stream-spook/` の並びは本体の `src-tauri/src/obs_plugin.rs` が読む契約なので、形を変えるときは両方を直す。
 
-## 7. 公開リポジトリ（ミラー）
+## 8. 公開リポジトリ（ミラー）
 
 GPL の「ソースを渡す」義務は、公開用のミラー [Fortyworks/stream-spook-obs-plugin](https://github.com/Fortyworks/stream-spook-obs-plugin) で満たす。こちら（開発用）は非公開のままで、履歴・PR・Actions の実行はここにしか残らない。
 

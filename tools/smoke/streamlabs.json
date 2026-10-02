@@ -1,0 +1,6 @@
+{
+    "comment": "Run-Smoke.ps1 -Streamlabs が読み込む Streamlabs Desktop の libobs（独自のフォーク）。obs-studio-node の .github/workflows/main.yml の LibOBSVersion と、obs-studio-server/CMakeLists.txt の OSN_DEFAULT_LIBOBS_URL から引いた",
+    "version": "32.1.1sl12",
+    "url": "https://obsstudios3.streamlabs.com/libobs-windows64-release-32.1.1sl12.7z",
+    "sha256": "75ffcb76dae503a8697d910decf2659668966a4df01d99ee9d7cb561fae0ed88"
+}

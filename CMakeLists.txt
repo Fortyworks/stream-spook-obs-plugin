@@ -39,6 +39,9 @@ target_sources(
   PRIVATE
     src/plugin-main.c
     src/fx-anim.c
+    src/host.c
+    src/meters.c
+    src/pipe.c
     src/film-filter.c
     src/mosaic-filter.c
     src/vignette-filter.c

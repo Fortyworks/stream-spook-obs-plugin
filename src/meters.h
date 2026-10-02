@@ -9,19 +9,11 @@
  * the Free Software Foundation; either version 2 of the License, or
  * (at your option) any later version. See LICENSE for details.
  */
-/* シーントランジション「StreamSpook: スティンガー」（stinger-transition.c） */
+/* 入力ソースの音量（メーター）をアプリへ流す（meters.c） */
 #pragma once
 
-#include <stdbool.h>
-
-/* obs_module_load から呼ぶ（トランジションの種類を登録する） */
-void stinger_register(void);
-
-/* 登録したか（Streamlabs Desktop では登録しない） */
-bool stinger_available(void);
-
 /* obs_module_post_load から、ss_vendor_init のあとに呼ぶ */
-void stinger_init_vendor(void);
+void meters_init(void);
 
 /* obs_module_unload から呼ぶ */
-void stinger_shutdown(void);
+void meters_shutdown(void);

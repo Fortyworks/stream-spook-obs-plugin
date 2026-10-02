@@ -13,6 +13,13 @@
 #
 # 使い方: pwsh obs-plugin/tools/smoke/Run-Smoke.ps1
 # 終了コード 0 なら OK。シェーダーの警告・エラーは出力に [obs 300] 以下で出る。
+#
+# -Streamlabs を付けると、同じプラグインの DLL を Streamlabs Desktop の libobs
+# （独自のフォーク。streamlabs.json の版を .deps に落としてくる）に読み込んで回す。
+# smoke.exe はフォークのヘッダで組み直す（obs_video_info の形が違うため）。
+# プラグインのほうは組み直さない（配る DLL 1 つで両方に入る、を確かめるのが目的）。
+
+param([switch]$Streamlabs)
 
 $ErrorActionPreference = "Stop"
 
@@ -42,6 +49,54 @@ if (-not $vs) { throw "Visual Studio (C++ ツール) が見つからない" }
 $cmake = Join-Path $vs "Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
 if (-not (Test-Path $cmake)) { $cmake = "cmake" }
 
+$out = Join-Path $root "build_x64\smoke"
+New-Item -ItemType Directory -Force $out | Out-Null
+
+if ($Streamlabs) {
+    # Streamlabs の libobs は組まずに、配っているものをそのまま使う（ヘッダ・obs.lib・DLL 一式が入っている）
+    $sl = Get-Content (Join-Path $PSScriptRoot "streamlabs.json") -Raw -Encoding UTF8 | ConvertFrom-Json
+    $slDir = Join-Path $deps "streamlabs-libobs-$($sl.version)"
+    $slInstall = Join-Path $slDir "install"
+    if (-not (Test-Path $slInstall)) {
+        $archive = Join-Path $deps "libobs-windows64-release-$($sl.version).7z"
+        if (-not (Test-Path $archive)) {
+            Write-Host "== download Streamlabs libobs $($sl.version)"
+            Invoke-WebRequest -Uri $sl.url -OutFile $archive -UseBasicParsing
+        }
+        $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
+        if ($hash -ne $sl.sha256) { throw "sha256 が合わない: $archive ($hash)" }
+        New-Item -ItemType Directory -Force $slDir | Out-Null
+        # Windows の tar（libarchive）は 7z も開ける
+        & "$env:SystemRoot\System32\tar.exe" -xf $archive -C $slDir
+        if ($LASTEXITCODE -ne 0) { throw "展開に失敗: $archive" }
+    }
+    $slBin = Join-Path $slInstall "bin\64bit"
+    $slData = Join-Path $slInstall "data\libobs"
+
+    $bat = Join-Path $out "build-streamlabs.bat"
+    @"
+@echo off
+set "PATH=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer;%PATH%"
+call "$vs\VC\Auxiliary\Build\vcvars64.bat" >nul
+cd /d "$out"
+cl /nologo /W3 /wd4996 /utf-8 /DSMOKE_STREAMLABS /I "$slInstall\include" /I "$root\src" "$PSScriptRoot\smoke.c" /link "$slInstall\lib\obs.lib" /OUT:smoke-streamlabs.exe
+"@ | Set-Content -Encoding ascii $bat
+    Write-Host "== build smoke-streamlabs.exe"
+    cmd /c $bat
+    if ($LASTEXITCODE -ne 0) { throw "smoke-streamlabs.exe のビルドに失敗" }
+
+    Write-Host "== run (Streamlabs libobs $($sl.version))"
+    $env:PATH = "$slBin;$env:PATH"
+    Push-Location $slBin
+    try {
+        & (Join-Path $out "smoke-streamlabs.exe") "$slData\" $pluginDll $pluginData
+        $code = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
+    exit $code
+}
+
 # 1. libobs-d3d11（OBS 本体のビルドでは libobs しか組んでいない）
 $d3d = Join-Path $obsBuild "libobs-d3d11\Release\libobs-d3d11.dll"
 if (-not (Test-Path $d3d)) {
@@ -52,8 +107,6 @@ if (-not (Test-Path $d3d)) {
 Copy-Item $d3d $runBin -Force
 
 # 2. smoke.exe
-$out = Join-Path $root "build_x64\smoke"
-New-Item -ItemType Directory -Force $out | Out-Null
 $bat = Join-Path $out "build.bat"
 @"
 @echo off

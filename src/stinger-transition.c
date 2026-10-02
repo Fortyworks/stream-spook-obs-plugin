@@ -78,6 +78,7 @@
 #include <string.h>
 
 #include "plugin-support.h"
+#include "host.h"
 #include "vendor.h"
 
 #define REQ_CONFIGURE "stinger_configure"
@@ -158,6 +159,7 @@ static struct {
 	pthread_mutex_t mutex;
 	DARRAY(struct stinger *) list;
 	obs_data_t *last_config; /* stinger_configure で最後に来たもの。無ければ NULL */
+	bool registered;         /* Streamlabs Desktop では登録しない（stinger_register） */
 } G;
 
 static const char *stinger_get_name(void *type_data)
@@ -775,15 +777,29 @@ void stinger_register(void)
 	pthread_mutex_init(&G.mutex, NULL);
 	da_init(G.list);
 	G.last_config = NULL;
+	G.registered = false;
+	/* Streamlabs Desktop の libobs は obs_source_info の audio_render の直後に項目を
+	 * 1 つ挿し込んでいて、このトランジションが使う後ろの項目（enum_all_sources /
+	 * transition_start …）が 1 つずつずれて別の関数として呼ばれる（作った瞬間に落ちる）。
+	 * Streamlabs の画面はプラグインのトランジションを選ばせもしないので、登録しない（host.h） */
+	if (ss_host() == SS_HOST_STREAMLABS) {
+		obs_log(LOG_INFO, "stinger transition is not available on Streamlabs Desktop");
+		return;
+	}
 	obs_register_source(&stinger_transition_info);
+	G.registered = true;
+}
+
+bool stinger_available(void)
+{
+	return G.registered;
 }
 
 /* obs_module_post_load から（vendor が要る） */
 void stinger_init_vendor(void)
 {
-	obs_websocket_vendor v = ss_vendor();
-	if (v)
-		obs_websocket_vendor_register_request(v, REQ_CONFIGURE, req_configure, NULL);
+	if (G.registered && ss_vendor_available())
+		ss_vendor_register_request(REQ_CONFIGURE, req_configure, NULL);
 }
 
 void stinger_shutdown(void)

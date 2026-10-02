@@ -36,6 +36,14 @@
 
 static int failures = 0;
 
+#ifdef SMOKE_STREAMLABS
+#define EXPECTED_HOST "streamlabs"
+#define EXPECTED_VENDOR_REQS 6
+#else
+#define EXPECTED_HOST "obs"
+#define EXPECTED_VENDOR_REQS 7
+#endif
+
 static void log_handler(int lvl, const char *msg, va_list args, void *p)
 {
 	(void)p;
@@ -44,6 +52,13 @@ static void log_handler(int lvl, const char *msg, va_list args, void *p)
 	if (lvl <= LOG_WARNING || strstr(buf, "stream-spook") || strstr(buf, "effect") || strstr(buf, "Shader"))
 		printf("[obs %d] %s\n", lvl, buf);
 	if (lvl <= LOG_WARNING && (strstr(buf, "Shader") || strstr(buf, "effect") || strstr(buf, "stream-spook")))
+		failures++;
+}
+
+static void check(bool ok, const char *what)
+{
+	printf("%s %s\n", ok ? "OK " : "NG ", what);
+	if (!ok)
 		failures++;
 }
 
@@ -255,7 +270,7 @@ static void try_filter(const char *id, obs_data_t *settings)
 }
 
 /* ---- fake obs-websocket: vendor API is nothing but proc_handler calls ---- */
-#define MAX_VENDOR_REQS 8
+#define MAX_VENDOR_REQS 16
 static proc_handler_t *fake_ph;
 static struct {
 	char type[64];
@@ -265,6 +280,8 @@ static struct {
 static size_t vendor_req_count;
 static int vendor_events;
 static char last_event[8192];
+static int meters_events;
+static char last_meters[8192];
 
 static void fake_get_ph(void *data, calldata_t *cd)
 {
@@ -293,7 +310,15 @@ static void fake_event_emit(void *data, calldata_t *cd)
 {
 	(void)data;
 	obs_data_t *d = calldata_ptr(cd, "data");
+	const char *type = calldata_string(cd, "type");
 	const char *json = d ? obs_data_get_json(d) : NULL;
+	if (type && strcmp(type, "meters") == 0) {
+		if (json)
+			strncpy(last_meters, json, sizeof(last_meters) - 1);
+		meters_events++;
+		calldata_set_bool(cd, "success", true);
+		return;
+	}
 	if (json)
 		strncpy(last_event, json, sizeof(last_event) - 1);
 	vendor_events++;
@@ -429,14 +454,14 @@ static obs_data_t *keys_request(const char *k1, const char *k2, const char *k3)
 static void test_spectrum(void)
 {
 	printf("== audio spectrum\n");
-	if (vendor_req_count != 4) {
-		printf("NG  expected 4 vendor requests, got %zu\n", vendor_req_count);
+	/* host_info 1 + spectrum 3 + meters 2 (+ stinger 1。Streamlabs では登録しない) */
+	if (vendor_req_count != EXPECTED_VENDOR_REQS) {
+		printf("NG  expected %d vendor requests, got %zu\n", EXPECTED_VENDOR_REQS, vendor_req_count);
 		failures++;
 		return;
 	}
-	printf("OK  4 vendor requests registered (3 spectrum + 1 stinger)\n");
+	printf("OK  %d vendor requests registered\n", EXPECTED_VENDOR_REQS);
 
-	obs_register_source(&tone_info);
 	obs_source_t *tone = obs_source_create("smoke_tone", "tone", NULL, NULL);
 	char input_key[80];
 	snprintf(input_key, sizeof input_key, "input-%s", obs_source_get_uuid(tone));
@@ -573,13 +598,6 @@ static obs_data_t *stinger_config(const char *url, int duration_ms, int point_ms
 	obs_data_set_int(req, "duration_ms", duration_ms);
 	obs_data_set_int(req, "point_ms", point_ms);
 	return req;
-}
-
-static void check(bool ok, const char *what)
-{
-	printf("%s %s\n", ok ? "OK " : "NG ", what);
-	if (!ok)
-		failures++;
 }
 
 static void stinger_scene(obs_data_array_t *scenes, const char *uuid, int duration_ms, int point_ms)
@@ -790,6 +808,243 @@ static void test_stinger(void)
 	obs_source_release(c);
 	obs_source_release(tr);
 }
+
+/* どこに読み込まれたかと、使えるものの一覧（アプリがつないで最初に聞く） */
+static void test_host_info(void)
+{
+	printf("== host info\n");
+	obs_data_t *res = vendor_call("host_info", NULL);
+	obs_data_t *features = obs_data_get_obj(res, "features");
+	const bool stinger = features && obs_data_get_bool(features, "stinger");
+	printf("    host=%s libobs=%s version=%s stinger=%d\n", obs_data_get_string(res, "host"),
+	       obs_data_get_string(res, "libobs"), obs_data_get_string(res, "version"), stinger);
+	check(strcmp(obs_data_get_string(res, "host"), EXPECTED_HOST) == 0, "host_info names the host");
+#ifdef SMOKE_STREAMLABS
+	check(!stinger, "host_info: no stinger on Streamlabs");
+#else
+	check(stinger, "host_info: stinger on OBS");
+#endif
+	check(features && obs_data_get_bool(features, "meters") && obs_data_get_bool(features, "spectrum"),
+	      "host_info: meters and spectrum");
+	if (features)
+		obs_data_release(features);
+	obs_data_release(res);
+}
+
+/* 鍵 key の取り口の、いちばん大きい peak（倍率）。無ければ -1 */
+static double meters_peak(const char *json, const char *key)
+{
+	obs_data_t *ev = json && json[0] ? obs_data_create_from_json(json) : NULL;
+	obs_data_array_t *inputs = ev ? obs_data_get_array(ev, "inputs") : NULL;
+	double best = -1.0;
+	size_t n = inputs ? obs_data_array_count(inputs) : 0;
+	for (size_t i = 0; i < n; i++) {
+		obs_data_t *it = obs_data_array_item(inputs, i);
+		if (strcmp(obs_data_get_string(it, "k"), key) == 0) {
+			obs_data_array_t *levels = obs_data_get_array(it, "levels");
+			size_t nl = levels ? obs_data_array_count(levels) : 0;
+			best = 0.0;
+			for (size_t c = 0; c < nl; c++) {
+				obs_data_t *l = obs_data_array_item(levels, c);
+				if (obs_data_get_double(l, "p") > best)
+					best = obs_data_get_double(l, "p");
+				obs_data_release(l);
+			}
+			if (levels)
+				obs_data_array_release(levels);
+		}
+		obs_data_release(it);
+	}
+	if (inputs)
+		obs_data_array_release(inputs);
+	if (ev)
+		obs_data_release(ev);
+	return best;
+}
+
+/* 音量メーター: 0.5 の正弦波なら peak はおよそ 0.5（-6 dB） */
+static void test_meters(void)
+{
+	printf("== meters\n");
+	obs_source_t *tone = obs_source_create("smoke_tone", "meter tone", NULL, NULL);
+	char key[80];
+	snprintf(key, sizeof key, "input-%s", obs_source_get_uuid(tone));
+	uint64_t phase = 0;
+
+	obs_data_t *req = keys_request(key, "input-nope", NULL);
+	obs_data_t *res = vendor_call("meters_subscribe", req);
+	obs_data_array_t *active = obs_data_get_array(res, "active");
+	obs_data_array_t *rejected = obs_data_get_array(res, "rejected");
+	check(active && obs_data_array_count(active) == 1 && rejected && obs_data_array_count(rejected) == 1,
+	      "meters_subscribe: the tone is accepted, an unknown key is rejected");
+	if (active)
+		obs_data_array_release(active);
+	if (rejected)
+		obs_data_array_release(rejected);
+	obs_data_release(res);
+	obs_data_release(req);
+
+	const int before = meters_events;
+	last_meters[0] = '\0';
+	tone_feed(tone, &phase, 400);
+	const double peak = meters_peak(last_meters, key);
+	printf("    %d meters events in 400ms, peak=%.3f\n", meters_events - before, peak);
+	check(meters_events - before >= 4, "meters events arrive (about 20 per second)");
+	check(peak > 0.3 && peak < 0.7, "meters: peak of a 0.5 sine is about 0.5");
+
+	req = keys_request(key, NULL, NULL);
+	res = vendor_call("meters_unsubscribe", req);
+	obs_data_release(res);
+	obs_data_release(req);
+	last_meters[0] = '\0';
+	tone_feed(tone, &phase, 200);
+	check(meters_peak(last_meters, key) < 0, "meters: unsubscribed tone is gone");
+
+	obs_source_remove(tone);
+	obs_source_release(tone);
+}
+
+#ifdef SMOKE_STREAMLABS
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include "pipe.h"
+
+static char pipe_acc[65536];
+static size_t pipe_acc_len;
+
+/* パイプから 1 行読む。timeout_ms のうちに来なければ false */
+static bool pipe_read_line(HANDLE h, char *out, size_t out_size, int timeout_ms)
+{
+	const uint64_t until = os_gettime_ns() + (uint64_t)timeout_ms * 1000000ULL;
+	while (true) {
+		char *nl = memchr(pipe_acc, '\n', pipe_acc_len);
+		if (nl) {
+			size_t n = (size_t)(nl - pipe_acc);
+			size_t copy = n < out_size - 1 ? n : out_size - 1;
+			memcpy(out, pipe_acc, copy);
+			out[copy] = '\0';
+			memmove(pipe_acc, nl + 1, pipe_acc_len - n - 1);
+			pipe_acc_len -= n + 1;
+			return true;
+		}
+		DWORD avail = 0;
+		if (!PeekNamedPipe(h, NULL, 0, NULL, &avail, NULL))
+			return false;
+		if (avail > 0 && pipe_acc_len < sizeof(pipe_acc)) {
+			DWORD got = 0;
+			DWORD want = (DWORD)(sizeof(pipe_acc) - pipe_acc_len);
+			if (avail < want)
+				want = avail;
+			if (!ReadFile(h, pipe_acc + pipe_acc_len, want, &got, NULL))
+				return false;
+			pipe_acc_len += got;
+			continue;
+		}
+		if (os_gettime_ns() > until)
+			return false;
+		os_sleep_ms(5);
+	}
+}
+
+static bool pipe_send(HANDLE h, const char *line)
+{
+	DWORD written = 0;
+	return WriteFile(h, line, (DWORD)strlen(line), &written, NULL) && written == strlen(line);
+}
+
+/* 応答（id が合うもの）が来るまで読む。途中のイベントは捨てる */
+static obs_data_t *pipe_wait_reply(HANDLE h, long long id)
+{
+	char line[16384];
+	while (pipe_read_line(h, line, sizeof line, 2000)) {
+		obs_data_t *msg = obs_data_create_from_json(line);
+		if (msg && obs_data_has_user_value(msg, "id") && obs_data_get_int(msg, "id") == id)
+			return msg;
+		if (msg)
+			obs_data_release(msg);
+	}
+	return NULL;
+}
+
+/* Streamlabs には obs-websocket が無いので、同じ要求をパイプで運ぶ */
+static void test_pipe(void)
+{
+	printf("== pipe (%s)\n", SS_PIPE_NAME);
+	HANDLE h = CreateFileA(SS_PIPE_NAME, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+	check(h != INVALID_HANDLE_VALUE, "pipe: connect");
+	if (h == INVALID_HANDLE_VALUE)
+		return;
+
+	pipe_send(h, "{\"id\":1,\"type\":\"host_info\"}\n");
+	obs_data_t *msg = pipe_wait_reply(h, 1);
+	obs_data_t *data = msg ? obs_data_get_obj(msg, "data") : NULL;
+	check(data && strcmp(obs_data_get_string(data, "host"), "streamlabs") == 0, "pipe: host_info answers");
+	if (data)
+		obs_data_release(data);
+	if (msg)
+		obs_data_release(msg);
+
+	pipe_send(h, "{\"id\":2,\"type\":\"no_such_request\",\"data\":{}}\n");
+	msg = pipe_wait_reply(h, 2);
+	check(msg && strcmp(obs_data_get_string(msg, "error"), "unknown_request") == 0,
+	      "pipe: unknown request gets an error");
+	if (msg)
+		obs_data_release(msg);
+
+	/* 音量メーターをパイプで購読して、イベントがパイプに流れてくるか */
+	obs_source_t *tone = obs_source_create("smoke_tone", "pipe tone", NULL, NULL);
+	char key[80], line[16384];
+	snprintf(key, sizeof key, "input-%s", obs_source_get_uuid(tone));
+	snprintf(line, sizeof line, "{\"id\":3,\"type\":\"meters_subscribe\",\"data\":{\"keys\":[{\"key\":\"%s\"}]}}\n",
+		 key);
+	pipe_send(h, line);
+	msg = pipe_wait_reply(h, 3);
+	check(msg != NULL, "pipe: meters_subscribe answers");
+	if (msg)
+		obs_data_release(msg);
+	uint64_t phase = 0;
+	tone_feed(tone, &phase, 400);
+	double peak = -1.0;
+	int events = 0;
+	while (pipe_read_line(h, line, sizeof line, 300)) {
+		obs_data_t *ev = obs_data_create_from_json(line);
+		if (ev && strcmp(obs_data_get_string(ev, "event"), "meters") == 0) {
+			obs_data_t *d = obs_data_get_obj(ev, "data");
+			const char *json = d ? obs_data_get_json(d) : NULL;
+			const double p = meters_peak(json, key);
+			if (p > peak)
+				peak = p;
+			events++;
+			if (d)
+				obs_data_release(d);
+		}
+		if (ev)
+			obs_data_release(ev);
+	}
+	printf("    %d meters events over the pipe, peak=%.3f\n", events, peak);
+	check(events >= 4 && peak > 0.3, "pipe: meters events stream over the pipe");
+
+	/* 切ったあとも落ちない。もう一度つなげる */
+	CloseHandle(h);
+	tone_feed(tone, &phase, 100);
+	pipe_acc_len = 0;
+	h = CreateFileA(SS_PIPE_NAME, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+	if (h == INVALID_HANDLE_VALUE && WaitNamedPipeA(SS_PIPE_NAME, 2000))
+		h = CreateFileA(SS_PIPE_NAME, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+	check(h != INVALID_HANDLE_VALUE, "pipe: reconnect after a disconnect");
+	if (h != INVALID_HANDLE_VALUE) {
+		pipe_send(h, "{\"id\":4,\"type\":\"host_info\"}\n");
+		msg = pipe_wait_reply(h, 4);
+		check(msg != NULL, "pipe: answers again after reconnecting");
+		if (msg)
+			obs_data_release(msg);
+		CloseHandle(h);
+	}
+
+	obs_source_remove(tone);
+	obs_source_release(tone);
+}
+#endif
 
 /* 美肌: 肌の色だけが変わり、肌でない色（青）は素通しになるか */
 static void skin_case(const char *label, obs_data_t *settings, int expect_probe, int expect_center)
@@ -1014,8 +1269,24 @@ int main(int argc, char **argv)
 	}
 
 	test_skin();
+	obs_register_source(&tone_info);
+	test_host_info();
 	test_spectrum();
+	test_meters();
+#ifdef SMOKE_STREAMLABS
+	test_pipe();
+	{
+		/* 構造体の並びが食い違うので、Streamlabs では登録していないこと */
+		bool listed = false;
+		const char *id;
+		for (size_t i = 0; obs_enum_transition_types(i, &id); i++)
+			if (strcmp(id, "stream_spook_stinger") == 0)
+				listed = true;
+		check(!listed, "stream_spook_stinger is not registered on Streamlabs");
+	}
+#else
 	test_stinger();
+#endif
 
 	obs_shutdown();
 	printf("failures=%d\n", failures);

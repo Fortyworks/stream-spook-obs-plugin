@@ -118,7 +118,7 @@ struct tap {
 };
 
 static struct {
-	obs_websocket_vendor vendor;
+	bool enabled;
 
 	pthread_mutex_t mutex; /* taps の出し入れと、tick の解析中 */
 	struct tap *taps[MAX_TAPS];
@@ -414,7 +414,7 @@ static void tick(void)
 	/* 送るのはロックの外で。obs-websocket 側の待ちで音の受け取りを止めない */
 	obs_data_t *ev = obs_data_create();
 	obs_data_set_array(ev, "taps", taps);
-	obs_websocket_vendor_emit_event(S.vendor, EVENT_SPECTRUM, ev);
+	ss_vendor_emit(EVENT_SPECTRUM, ev);
 	obs_data_release(ev);
 	obs_data_array_release(taps);
 }
@@ -558,14 +558,14 @@ void spectrum_init(void)
 	memset(&S, 0, sizeof(S));
 	pthread_mutex_init(&S.mutex, NULL);
 
-	S.vendor = ss_vendor();
-	if (!S.vendor) {
-		obs_log(LOG_INFO, "audio spectrum is disabled (no obs-websocket)");
+	if (!ss_vendor_available()) {
+		obs_log(LOG_INFO, "audio spectrum is disabled (no way to talk to the app)");
 		return;
 	}
-	obs_websocket_vendor_register_request(S.vendor, REQ_SOURCES, req_sources, NULL);
-	obs_websocket_vendor_register_request(S.vendor, REQ_SUBSCRIBE, req_subscribe, NULL);
-	obs_websocket_vendor_register_request(S.vendor, REQ_UNSUBSCRIBE, req_unsubscribe, NULL);
+	ss_vendor_register_request(REQ_SOURCES, req_sources, NULL);
+	ss_vendor_register_request(REQ_SUBSCRIBE, req_subscribe, NULL);
+	ss_vendor_register_request(REQ_UNSUBSCRIBE, req_unsubscribe, NULL);
+	S.enabled = true;
 
 	signal_handler_connect(obs_get_signal_handler(), "source_remove", on_source_remove, NULL);
 
@@ -594,7 +594,7 @@ void spectrum_shutdown(void)
 		os_event_destroy(S.stop);
 		S.stop = NULL;
 	}
-	if (S.vendor)
+	if (S.enabled)
 		signal_handler_disconnect(obs_get_signal_handler(), "source_remove", on_source_remove, NULL);
 
 	pthread_mutex_lock(&S.mutex);
