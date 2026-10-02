@@ -46,6 +46,7 @@ target_sources(
     src/chromatic-filter.c
     src/grade-filter.c
     src/lens-filter.c
+    src/skin-filter.c
     src/spectrum-analyzer.c
     src/spectrum.c
     src/stinger-transition.c

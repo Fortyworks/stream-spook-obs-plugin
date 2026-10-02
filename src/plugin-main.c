@@ -44,6 +44,7 @@ extern struct obs_source_info glitch_filter_info;
 extern struct obs_source_info chromatic_filter_info;
 extern struct obs_source_info grade_filter_info;
 extern struct obs_source_info lens_filter_info;
+extern struct obs_source_info skin_filter_info;
 
 bool obs_module_load(void)
 {
@@ -55,6 +56,7 @@ bool obs_module_load(void)
 	obs_register_source(&chromatic_filter_info);
 	obs_register_source(&grade_filter_info);
 	obs_register_source(&lens_filter_info);
+	obs_register_source(&skin_filter_info);
 	stinger_register();
 
 	obs_log(LOG_INFO, "plugin loaded successfully (version %s)", PLUGIN_VERSION);

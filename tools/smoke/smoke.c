@@ -134,6 +134,40 @@ static struct obs_source_info red_info = {
 };
 
 /* 境目（x = TW/4）のすぐ左。ここの色が動けば、座標をずらすフィルタが効いている */
+/* 美肌の確かめ用。左 1/4 が肌の色、残りが青（肌ではない色） */
+#define SKIN_R 0.88f
+#define SKIN_G 0.67f
+#define SKIN_B 0.55f
+static void skin_render_src(void *d, gs_effect_t *e)
+{
+	(void)d;
+	(void)e;
+	gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
+	struct vec4 c;
+	vec4_set(&c, 0.2f, 0.6f, 0.9f, 1.0f);
+	gs_effect_set_vec4(gs_effect_get_param_by_name(solid, "color"), &c);
+	gs_technique_t *tech = gs_effect_get_technique(solid, "Solid");
+	gs_technique_begin(tech);
+	gs_technique_begin_pass(tech, 0);
+	gs_draw_sprite(NULL, 0, TW, TH);
+	vec4_set(&c, SKIN_R, SKIN_G, SKIN_B, 1.0f);
+	gs_effect_set_vec4(gs_effect_get_param_by_name(solid, "color"), &c);
+	gs_draw_sprite(NULL, 0, TW / 4, TH);
+	gs_technique_end_pass(tech);
+	gs_technique_end(tech);
+}
+static struct obs_source_info skin_src_info = {
+	.id = "smoke_skin",
+	.type = OBS_SOURCE_TYPE_INPUT,
+	.output_flags = OBS_SOURCE_VIDEO,
+	.get_name = color_name,
+	.create = color_create,
+	.destroy = color_destroy,
+	.get_width = color_w,
+	.get_height = color_h,
+	.video_render = skin_render_src,
+};
+
 #define PROBE_X (TW / 4 - 2)
 
 /* render src (with its filters) into a texture and read a few pixels back */
@@ -757,6 +791,92 @@ static void test_stinger(void)
 	obs_source_release(tr);
 }
 
+/* 美肌: 肌の色だけが変わり、肌でない色（青）は素通しになるか */
+static void skin_case(const char *label, obs_data_t *settings, int expect_probe, int expect_center)
+{
+	/* expect_*: 0 = 元のまま / 1 = 明るくなる / 2 = 白（範囲の白黒）/ 3 = 黒 */
+	obs_source_t *s = obs_source_create_private("stream_spook_skin", "t", settings);
+	if (!s) {
+		printf("NG  skin %s: create returned NULL\n", label);
+		failures++;
+		return;
+	}
+	obs_source_t *src = obs_source_create_private("smoke_skin", "c", NULL);
+	obs_source_filter_add(src, s);
+	uint8_t c[4] = {0}, k[4] = {0}, p[4] = {0};
+	bool ok = render_and_read(src, c, k, p);
+	const int skin[3] = {(int)(SKIN_R * 255.0f + 0.5f), (int)(SKIN_G * 255.0f + 0.5f),
+			     (int)(SKIN_B * 255.0f + 0.5f)};
+	const int blue[3] = {51, 153, 230};
+	const int expects[2] = {expect_probe, expect_center};
+	const uint8_t *got[2] = {p, c};
+	const int *orig[2] = {skin, blue};
+	for (int i = 0; ok && i < 2; i++) {
+		const uint8_t *g = got[i];
+		const int *o = orig[i];
+		const int sum_g = g[0] + g[1] + g[2], sum_o = o[0] + o[1] + o[2];
+		switch (expects[i]) {
+		case 0:
+			ok = abs(g[0] - o[0]) <= 3 && abs(g[1] - o[1]) <= 3 && abs(g[2] - o[2]) <= 3;
+			break;
+		case 1:
+			ok = sum_g > sum_o + 15;
+			break;
+		case 2:
+			ok = g[0] > 200 && g[1] > 200 && g[2] > 200;
+			break;
+		case 3:
+			ok = g[0] < 30 && g[1] < 30 && g[2] < 30;
+			break;
+		}
+	}
+	printf("%s skin %s: probe=(%d,%d,%d) center=(%d,%d,%d)\n", ok ? "OK " : "NG ", label, p[0], p[1], p[2], c[0],
+	       c[1], c[2]);
+	if (!ok)
+		failures++;
+	obs_source_filter_remove(src, s);
+	obs_source_release(src);
+	obs_source_release(s);
+}
+
+static void test_skin(void)
+{
+	obs_register_source(&skin_src_info);
+	/* 既定: 肌は明るく、青はそのまま */
+	skin_case("default", NULL, 1, 0);
+	{
+		obs_data_t *d = obs_data_create();
+		obs_data_set_bool(d, "show_mask", true);
+		skin_case("mask", d, 2, 3);
+		obs_data_release(d);
+	}
+	{
+		/* なめらかにするだけ（一色の面なので色は変わらない。描けることだけ見る） */
+		obs_data_t *d = obs_data_create();
+		obs_data_set_double(d, "whiten", 0.0);
+		obs_data_set_bool(d, "smooth_enabled", true);
+		obs_data_set_double(d, "smooth_strength", 1.0);
+		skin_case("smooth only", d, 0, 0);
+		obs_data_release(d);
+	}
+	{
+		/* なめらかさオフ + 色調補正 */
+		obs_data_t *d = obs_data_create();
+		obs_data_set_bool(d, "smooth_enabled", false);
+		obs_data_set_double(d, "whiten", 1.0);
+		skin_case("tone only", d, 1, 0);
+		obs_data_release(d);
+	}
+	{
+		obs_data_t *d = obs_data_create();
+		obs_data_set_double(d, "strength", 0.0);
+		skin_case("strength 0", d, 0, 0);
+		obs_data_release(d);
+	}
+	/* 設定欄が組めるか（チェック付きの見出しを含む） */
+	try_filter("stream_spook_skin", NULL);
+}
+
 int main(int argc, char **argv)
 {
 	if (argc < 4) {
@@ -893,6 +1013,7 @@ int main(int argc, char **argv)
 		obs_data_release(d);
 	}
 
+	test_skin();
 	test_spectrum();
 	test_stinger();
 

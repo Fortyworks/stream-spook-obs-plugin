@@ -167,6 +167,25 @@ C が引いているキーが `data/locale/en-US.ini` と `ja-JP.ini` の両方�
 | `fit` | bool | 樽型のときに角が元の外を指さないよう内側へ寄せる（既定オン） |
 | `transparent` | bool | 元の外を指した所を透明にする（偽なら端の色を伸ばす。既定オン） |
 
+### 美肌 `stream_spook_skin`
+
+揺らす対象: `strength`（元の絵との混ぜ具合）。カメラのソースに掛ける想定。
+
+肌の範囲は色だけで決める（YCbCr の Cb / Cr が肌の色の楕円に入っているか。顔の検出はしない）。肌に近い色の背景（木の壁・ベージュの服）も一緒に拾うので、範囲の広さと境目のなだらかさで合わせる。合わせるときは `show_mask` で範囲を白黒で見る。順番は 範囲を決める → なめらかにする → 色調補正 → 元の絵と混ぜる。
+
+| キー | 範囲 | 意味 |
+|---|---|---|
+| `whiten` | 0..1 | 色調補正（中間の明るさを持ち上げ、赤みを抜く）の強さ |
+| `redness` | 0..1 | 色調補正のうち、赤みを抜く割合 |
+| `smooth_enabled` | bool | なめらかにするか（OBS の設定画面ではチェック付きの見出し） |
+| `smooth_strength` | 0..1 | なめらかさ（輪郭を残すぼかし。強いほど色の離れた点まで混ぜる） |
+| `smooth_radius` | 1..20 px | ぼかす範囲 |
+| `skin_range` | 0..1 | 肌とみなす色の範囲の広さ |
+| `skin_softness` | 0..1 | 範囲の境目のなだらかさ |
+| `show_mask` | bool | 肌とみなした範囲を白黒で出す（合わせるとき用。効きが 0 でも描く） |
+
+`whiten` と `smooth_strength` も `transition_ms` で移る（揺らしはしない）。`smooth_enabled` のオン / オフも、なめらかさを 0 へ移す形でつなぐ。`whiten` と（なめらかさがオフか 0 の）両方が 0 のフレームは素通しにする。
+
 ## 3. オーディオビジュアライザー（音の取り口）
 
 StreamSpook 本体のカスタムオーバーレイにあるビジュアライザーは、既定では PC 全体の音（WASAPI のループバック）を本体が拾う。このプラグインが入っていると、**OBS の中を流れる音**を選べる。obs-websocket が流してくるのは音量（`InputVolumeMeters`）だけで周波数の成分が無いので、libobs の中で PCM を受けて FFT にかけ、帯の強さだけを外へ出す。
@@ -231,7 +250,7 @@ src/
   fx-anim.{h,c}       「強さ」を動かす共通部品（移り変わり＋揺らし）と、その設定欄
   film-filter.c       セピアと黒澤（1 つの effect の technique 違い）
   mosaic-filter.c / vignette-filter.c / glitch-filter.c
-  chromatic-filter.c / grade-filter.c / lens-filter.c
+  chromatic-filter.c / grade-filter.c / lens-filter.c / skin-filter.c
   spectrum.{h,c}      オーディオビジュアライザー用の音の取り口（vendor API・購読・期限）
   spectrum-analyzer.{h,c}  帯の計算（libobs に依存しない。単体で確かめられる）
   stinger-transition.{h,c} シーントランジション「スティンガー」（ブラウザソースを重ねる）

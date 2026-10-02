@@ -1,0 +1,152 @@
+// StreamSpook for OBS
+// Copyright (C) 2026 Fortyworks
+// SPDX-License-Identifier: GPL-2.0-or-later
+// This file is part of a GPL-2.0-or-later program; see LICENSE.
+
+// 美肌。肌らしい色のところだけを、なめらかにして（任意）、明るく・赤みを抜く。
+//
+// 順番: 肌の範囲を決める（色だけで見る。顔の検出はしない） → なめらかにする
+//       → 色調補正（明るく・赤みを抜く） → 元の絵と混ぜる（strength）
+//
+// 肌の範囲は YCbCr の Cb / Cr が肌の色の楕円に入っているかで決める。明るさ（Y）は
+// 見ないので、影になった頬も明るい額も同じように拾う（暗すぎる・白すぎるところだけ外す）。
+// 肌に近い色の背景（木の壁・ベージュの服）も一緒に拾うので、範囲の広さと境目の
+// なだらかさをつまみで決められるようにし、範囲を白黒で見られるようにしてある（show_mask）。
+//
+// なめらかにするのは 1 回の描画で済ませる、輪郭を残すぼかし（色の近い点だけを混ぜる）。
+// 目・眉・口の輪郭のように色が大きく変わるところは混ざらない。
+
+uniform float4x4 ViewProj;
+uniform texture2d image;
+
+uniform float2 uv_size;          // 対象の大きさ（px）
+uniform float strength;          // 0..1  元の絵と混ぜる（アニメーション済み）
+uniform float whiten;            // 0..1  色調補正（明るく・赤みを抜く）の強さ
+uniform float redness;           // 0..1  色調補正のうち、赤みを抜く割合
+uniform float smooth_amount;     // 0..1  なめらかさ（オフなら 0 で渡る）
+uniform float smooth_radius;     // px    ぼかす範囲
+uniform float skin_range;        // 0..1  肌とみなす色の範囲の広さ
+uniform float skin_softness;     // 0..1  範囲の境目のなだらかさ
+uniform float show_mask;         // 0 / 1 肌とみなした範囲を白黒で出す
+
+sampler_state textureSampler {
+	Filter    = Linear;
+	AddressU  = Clamp;
+	AddressV  = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData vert_out;
+	vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv  = v_in.uv;
+	return vert_out;
+}
+
+float luma(float3 c)
+{
+	return dot(c, float3(0.299, 0.587, 0.114));
+}
+
+// 肌らしさ（0..1）。楕円の中心と半径は、肌の色の分布としてよく使われる
+// Cb 77..127 / Cr 133..173（8bit）から取っている
+float skin_mask(float3 c)
+{
+	float y  = luma(c);
+	float cb = (c.b - y) * 0.564 + 0.5;
+	float cr = (c.r - y) * 0.713 + 0.5;
+	float scale = 0.6 + skin_range * 0.8;
+	float2 d = (float2(cb, cr) - float2(0.40, 0.60)) / (float2(0.10, 0.08) * scale);
+	float r = length(d);
+	float soft = 0.05 + skin_softness * 0.6;
+	float m = 1.0 - smoothstep(1.0 - soft, 1.0 + soft, r);
+	// 真っ暗・真っ白は色が当てにならないので外す
+	m *= smoothstep(0.06, 0.18, y) * (1.0 - smoothstep(0.92, 0.99, y));
+	return m;
+}
+
+// なめらかにする 1 点ぶん。色が中心に近いほど重く混ぜる。返すのは (色 × 重み, 重み)
+// （inout を使わない。macOS / Linux で GLSL に変換するときに通らないことがあるため）
+float4 smooth_tap(float2 uv, float2 off, float3 c0, float inv_sigma2, float w_space)
+{
+	float3 c = image.Sample(textureSampler, uv + off).rgb;
+	float3 dc = c - c0;
+	float w = w_space * exp(-dot(dc, dc) * inv_sigma2);
+	return float4(c * w, w);
+}
+
+float3 smooth_skin(float2 uv, float3 c0)
+{
+	float2 px = smooth_radius / uv_size;
+	// 強いほど、色の離れた点まで混ぜる（=のっぺりする）
+	float sigma = 0.035 + smooth_amount * 0.09;
+	float inv_sigma2 = 1.0 / (2.0 * sigma * sigma);
+
+	// 中心の 1 点は重み 1
+	float4 acc = float4(c0, 1.0);
+	// 内側の輪（半径の半分）。8 方向
+	float2 h = px * 0.5;
+	acc += smooth_tap(uv, float2( h.x,  0.0), c0, inv_sigma2, 0.8);
+	acc += smooth_tap(uv, float2(-h.x,  0.0), c0, inv_sigma2, 0.8);
+	acc += smooth_tap(uv, float2( 0.0,  h.y), c0, inv_sigma2, 0.8);
+	acc += smooth_tap(uv, float2( 0.0, -h.y), c0, inv_sigma2, 0.8);
+	acc += smooth_tap(uv, float2( h.x,  h.y) * 0.7071, c0, inv_sigma2, 0.8);
+	acc += smooth_tap(uv, float2(-h.x,  h.y) * 0.7071, c0, inv_sigma2, 0.8);
+	acc += smooth_tap(uv, float2( h.x, -h.y) * 0.7071, c0, inv_sigma2, 0.8);
+	acc += smooth_tap(uv, float2(-h.x, -h.y) * 0.7071, c0, inv_sigma2, 0.8);
+	// 外側の輪（半径いっぱい）。内側と 22.5 度ずらして、縞が出ないようにする
+	acc += smooth_tap(uv, float2( 0.9239,  0.3827) * px, c0, inv_sigma2, 0.45);
+	acc += smooth_tap(uv, float2( 0.3827,  0.9239) * px, c0, inv_sigma2, 0.45);
+	acc += smooth_tap(uv, float2(-0.3827,  0.9239) * px, c0, inv_sigma2, 0.45);
+	acc += smooth_tap(uv, float2(-0.9239,  0.3827) * px, c0, inv_sigma2, 0.45);
+	acc += smooth_tap(uv, float2(-0.9239, -0.3827) * px, c0, inv_sigma2, 0.45);
+	acc += smooth_tap(uv, float2(-0.3827, -0.9239) * px, c0, inv_sigma2, 0.45);
+	acc += smooth_tap(uv, float2( 0.3827, -0.9239) * px, c0, inv_sigma2, 0.45);
+	acc += smooth_tap(uv, float2( 0.9239, -0.3827) * px, c0, inv_sigma2, 0.45);
+	return acc.rgb / acc.a;
+}
+
+// 色調補正。中間の明るさを持ち上げ（白い所は白いまま）、赤みを抜いて少しだけ青みへ
+float3 whiten_skin(float3 c)
+{
+	float k = whiten;
+	float3 w = 1.0 - pow(saturate(1.0 - c), 1.0 + k * 0.9);
+	float y = luma(w);
+	w = lerp(w, float3(y, y, y), k * redness * 0.35);
+	w += float3(-0.025, 0.0, 0.02) * k * redness;
+	return saturate(w);
+}
+
+float4 PSSkin(VertData v_in) : TARGET
+{
+	float4 src = image.Sample(textureSampler, v_in.uv);
+	float3 c = src.rgb;
+	float m = skin_mask(c);
+
+	if (show_mask > 0.5)
+		return float4(m, m, m, src.a);
+
+	if (smooth_amount > 0.0 && smooth_radius > 0.0) {
+		// 混ぜ切らない（毛穴が全部消えると、肌がプラスチックに見える）
+		float3 s = smooth_skin(v_in.uv, c);
+		c = lerp(c, s, m * smooth_amount * 0.85);
+	}
+	if (whiten > 0.0)
+		c = lerp(c, whiten_skin(c), m);
+
+	return float4(lerp(src.rgb, c, strength), src.a);
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSSkin(v_in);
+	}
+}
