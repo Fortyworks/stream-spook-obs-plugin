@@ -809,6 +809,126 @@ static void test_stinger(void)
 	obs_source_release(tr);
 }
 
+/* スティンガーの中のブラウザの代わり（obs-browser は読み込まないので）。
+ * 音を持つソースとして作られれば、モニタリングの掛かり方が見られる */
+static const char *fake_browser_name(void *d)
+{
+	(void)d;
+	return "fake browser";
+}
+static void *fake_browser_create(obs_data_t *s, obs_source_t *src)
+{
+	(void)s;
+	(void)src;
+	return bzalloc(1);
+}
+static void fake_browser_destroy(void *d)
+{
+	bfree(d);
+}
+static uint32_t fake_browser_size(void *d)
+{
+	(void)d;
+	return 0;
+}
+static struct obs_source_info fake_browser_info = {
+	.id = "browser_source",
+	.type = OBS_SOURCE_TYPE_INPUT,
+	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_AUDIO,
+	.get_name = fake_browser_name,
+	.create = fake_browser_create,
+	.destroy = fake_browser_destroy,
+	.get_width = fake_browser_size,
+	.get_height = fake_browser_size,
+};
+
+static void find_browser(obs_source_t *parent, obs_source_t *child, void *param)
+{
+	(void)parent;
+	if (strcmp(obs_source_get_id(child), "browser_source") == 0)
+		*(obs_source_t **)param = child;
+}
+
+/* スティンガーの中のブラウザのモニタリング。見つからなければ -1 */
+static int stinger_monitoring(obs_source_t *tr)
+{
+	obs_source_t *browser = NULL;
+	obs_source_enum_full_tree(tr, find_browser, &browser);
+	const int type = browser ? (int)obs_source_get_monitoring_type(browser) : -1;
+	printf("    monitoring=%d\n", type);
+	return type;
+}
+
+/* 送ったモニタリングを、次の video_tick まで待ってから読む（obs_source_update は延びる） */
+static int configure_monitoring(obs_source_t *tr, const char *monitoring)
+{
+	obs_data_t *req = stinger_config("http://127.0.0.1:1/overlay/stinger?m=1", 1000, 500);
+	if (monitoring)
+		obs_data_set_string(req, "monitoring", monitoring);
+	obs_data_t *res = vendor_call("stinger_configure", req);
+	obs_data_release(res);
+	obs_data_release(req);
+	os_sleep_ms(100);
+	return stinger_monitoring(tr);
+}
+
+/* 配信者の耳にも鳴らす（中のブラウザの音声モニタリング）。
+ * 偽のブラウザを登録すると、このあと作るスティンガーは全部それを持つので最後に回す */
+static void test_stinger_monitor(void)
+{
+	printf("== stinger monitoring\n");
+	obs_register_source(&fake_browser_info);
+
+	/* 省いたら「なし」（モニタリングを知らない本体からの要求で、配信の音を変えない） */
+	{
+		obs_data_t *req = stinger_config("http://127.0.0.1:1/overlay/stinger?m=1", 1000, 500);
+		obs_data_t *res = vendor_call("stinger_configure", req);
+		check(obs_data_get_bool(res, "monitoring"), "configure reports it knows monitoring");
+		obs_data_release(res);
+		obs_data_release(req);
+	}
+	obs_source_t *tr = obs_source_create_private("stream_spook_stinger", "stm", NULL);
+	check(tr != NULL, "create with a (fake) browser source");
+	if (!tr)
+		return;
+	check(stinger_monitoring(tr) == OBS_MONITORING_TYPE_NONE, "no monitoring by default (like OBS's stinger)");
+
+	check(configure_monitoring(tr, "monitor_and_output") == OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT,
+	      "monitor_and_output reaches the browser");
+	{
+		obs_data_t *st = obs_source_get_settings(tr);
+		check(strcmp(obs_data_get_string(st, "monitoring"), "monitor_and_output") == 0,
+		      "monitoring persists in the source settings");
+		obs_data_release(st);
+	}
+	check(configure_monitoring(tr, "monitor_only") == OBS_MONITORING_TYPE_MONITOR_ONLY,
+	      "monitor_only reaches the browser");
+	check(configure_monitoring(tr, "loud") == OBS_MONITORING_TYPE_NONE, "an unknown value is none");
+	check(configure_monitoring(tr, "monitor_only") == OBS_MONITORING_TYPE_MONITOR_ONLY &&
+		      configure_monitoring(tr, NULL) == OBS_MONITORING_TYPE_NONE,
+	      "omitting monitoring turns it off");
+
+	/* このあと ＋ から作られるぶんも、最後に配ったモニタリングで始まる */
+	configure_monitoring(tr, "monitor_and_output");
+	{
+		obs_source_t *tr2 = obs_source_create_private("stream_spook_stinger", "stm2", NULL);
+		check(tr2 && stinger_monitoring(tr2) == OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT,
+		      "a new stinger starts with the last monitoring");
+		obs_source_release(tr2);
+	}
+
+	/* 0.7 までに保存されたもの（monitoring を持っていない）は「なし」で読む */
+	{
+		obs_data_t *saved = stinger_config("http://saved/", 900, 450);
+		obs_source_t *tr3 = obs_source_create_private("stream_spook_stinger", "stm3", saved);
+		check(tr3 && stinger_monitoring(tr3) == OBS_MONITORING_TYPE_NONE,
+		      "a stinger saved before monitoring existed is not monitored");
+		obs_source_release(tr3);
+		obs_data_release(saved);
+	}
+	obs_source_release(tr);
+}
+
 /* どこに読み込まれたかと、使えるものの一覧（アプリがつないで最初に聞く） */
 static void test_host_info(void)
 {
@@ -1286,6 +1406,7 @@ int main(int argc, char **argv)
 	}
 #else
 	test_stinger();
+	test_stinger_monitor();
 #endif
 
 	obs_shutdown();

@@ -57,10 +57,26 @@
  *
  * ─── 話し方（obs-websocket の vendor API。vendor 名 "stream-spook"） ────────
  *   要求 stinger_configure  { url, duration_ms, point_ms,
- *                             scenes?: [{ uuid, duration_ms, point_ms }] }
- *                           → { count, per_scene: true }
+ *                             scenes?: [{ uuid, duration_ms, point_ms }],
+ *                             monitoring?: "none" | "monitor_only"
+ *                                        | "monitor_and_output" }
+ *                           → { count, per_scene: true, monitoring: true }
  *   上の duration_ms / point_ms は scenes に無い行き先に使う既定の値。
  *   per_scene は「行き先ごとの切り替え点を知っている版」の目印（0.4 は返さない）。
+ *   monitoring は中のブラウザの音声モニタリング（省く・知らない値は none）。
+ *   返事の monitoring は「モニタリングを知っている版」の目印（0.7 までは返さない）。
+ *
+ * ─── 音 ────────────────────────────────────────────────────────────────────
+ * ページの音はブラウザから OBS へ回し（reroute_audio）、切り替えの音として
+ * 配信に足す（stinger_audio_render）。トランジションは音声ミキサーに出ないので、
+ * そのままだと配信者には聞こえない。聞こえるようにするのは標準のスティンガーの
+ * 「音声モニタリング」と同じで、中のブラウザにモニタリングを掛ける。
+ * 3 つとも選べるようにしてあるのは、配信者の音の組み方で正解が違うため:
+ *   - デスクトップ音声がモニタリングデバイスと同じ機器を録っている（どちらも
+ *     「既定」のままがこれ）→「モニターのみ」。「モニターと出力」だと、
+ *     モニターの音をデスクトップ音声がもう一度拾って、配信に 2 回乗る
+ *   - 別の機器 →「モニターと出力」
+ * 既定は標準のスティンガーと同じ「なし」（いまの配信の音を変えない）。
  *
  * OBS のトランジションの一覧に足す口は obs-websocket にも frontend API にも無い
  * ので、足すのは配信者が OBS の「シーントランジション」の ＋ から 1 回だけやる。
@@ -120,6 +136,7 @@ struct stinger {
 	char *url;
 	uint32_t width;
 	uint32_t height;
+	enum obs_monitoring_type monitoring; /* 中のブラウザの音声モニタリング */
 
 	/* ここから下（描画と音が読む末尾の値を除く）は mutex の下で触る。
 	 * 設定は obs-websocket のスレッド、開始は UI のスレッド、決めるのは描画の
@@ -256,6 +273,24 @@ static void canvas_size(uint32_t *cx, uint32_t *cy)
 	}
 }
 
+/* 設定の monitoring（文字列）を読む。知らない値は「なし」 */
+static enum obs_monitoring_type parse_monitoring(const char *v)
+{
+	if (v && strcmp(v, "monitor_only") == 0)
+		return OBS_MONITORING_TYPE_MONITOR_ONLY;
+	if (v && strcmp(v, "monitor_and_output") == 0)
+		return OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT;
+	return OBS_MONITORING_TYPE_NONE;
+}
+
+/* モニタリングを設定に合わせる。同じ種類を掛け直すとモニターが作り直されて
+ * 音が一瞬途切れるので、違うときだけ掛ける */
+static void sync_monitoring(struct stinger *s)
+{
+	if (s->browser && obs_source_get_monitoring_type(s->browser) != s->monitoring)
+		obs_source_set_monitoring_type(s->browser, s->monitoring);
+}
+
 /* URL か大きさが変わったときだけブラウザへ渡す（同じ値でもページを読み直させない） */
 static void sync_browser(struct stinger *s)
 {
@@ -280,6 +315,7 @@ static void sync_browser(struct stinger *s)
 		obs_source_update(s->browser, bs);
 	}
 	obs_data_release(bs);
+	sync_monitoring(s);
 }
 
 /* 切り替え点を決める（描画と音が読む値） */
@@ -296,6 +332,7 @@ static void stinger_update(void *data, obs_data_t *settings)
 
 	bfree(s->url);
 	s->url = bstrdup(obs_data_get_string(settings, "url"));
+	s->monitoring = parse_monitoring(obs_data_get_string(settings, "monitoring"));
 
 	struct scene_timing fallback = {0};
 	read_timing(settings, &fallback);
@@ -332,12 +369,14 @@ static void stinger_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, "url", "");
 	obs_data_set_default_int(settings, "duration_ms", DURATION_DEFAULT_MS);
 	obs_data_set_default_int(settings, "point_ms", POINT_DEFAULT_MS);
+	obs_data_set_default_string(settings, "monitoring", "none");
 }
 
-/* config（url / duration_ms / point_ms / scenes）を settings へ写す */
+/* config（url / duration_ms / point_ms / scenes / monitoring）を settings へ写す */
 static void copy_config(obs_data_t *settings, obs_data_t *config)
 {
 	obs_data_set_string(settings, "url", obs_data_get_string(config, "url"));
+	obs_data_set_string(settings, "monitoring", obs_data_get_string(config, "monitoring"));
 	obs_data_set_int(settings, "duration_ms", obs_data_get_int(config, "duration_ms"));
 	obs_data_set_int(settings, "point_ms", obs_data_get_int(config, "point_ms"));
 	obs_data_array_t *in = obs_data_get_array(config, "scenes");
@@ -724,6 +763,7 @@ static void req_configure(obs_data_t *req, obs_data_t *res, void *priv)
 {
 	UNUSED_PARAMETER(priv);
 	obs_data_set_bool(res, "per_scene", true);
+	obs_data_set_bool(res, "monitoring", true);
 	if (!req) {
 		obs_data_set_int(res, "count", 0);
 		return;
@@ -737,6 +777,10 @@ static void req_configure(obs_data_t *req, obs_data_t *res, void *priv)
 	obs_data_set_int(config, "point_ms",
 			 obs_data_has_user_value(req, "point_ms") ? obs_data_get_int(req, "point_ms")
 								  : POINT_DEFAULT_MS);
+	/* 省いたら「なし」（モニタリングを知らない本体からの要求で、配信の音を変えない） */
+	obs_data_set_string(config, "monitoring",
+			    obs_data_has_user_value(req, "monitoring") ? obs_data_get_string(req, "monitoring")
+								       : "none");
 	/* 無ければ空。前に配った行き先ごとの設定を残さない（本体が外したものが残る） */
 	obs_data_array_t *in = obs_data_get_array(req, "scenes");
 	obs_data_array_t *scenes = copy_scenes(in);

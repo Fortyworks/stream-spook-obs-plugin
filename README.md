@@ -3,7 +3,7 @@
 [StreamSpook](https://streamspook.app) が OBS の中で受け持つぶん ―― 配信画面そのものに掛けるポストエフェクトや、OBS の中を流れる音など、ブラウザソースのオーバーレイでは届かないもの ―― のネイティブプラグイン。モジュール名は `stream-spook`、土台は [obs-plugintemplate](https://github.com/obsproject/obs-plugintemplate)。
 
 - **ライセンス: GPL-2.0-or-later**（[LICENSE](./LICENSE)）。libobs が GPL-2.0-or-later で、そのヘッダのコード（マクロ・`static inline`）がこの DLL に直接含まれるため。StreamSpook 本体とは別のプログラムで、話すのは obs-websocket の JSON だけ
-- **公開しているのは [Fortyworks/stream-spook-obs-plugin](https://github.com/Fortyworks/stream-spook-obs-plugin)。** リリースごとのスナップショット（1 版 = 1 コミット）で、開発の履歴と PR は入っていない。開発は非公開のリポジトリで行い、タグを打つと Actions がミラーへ積む（「8. 公開リポジトリ（ミラー）」）
+- **公開しているのは [Fortyworks/stream-spook-obs-plugin](https://github.com/Fortyworks/stream-spook-obs-plugin)。** リリースごとのスナップショット（1 版 = 1 コミット）で、開発の履歴と PR は入っていない。開発は非公開のリポジトリで行い、版を上げて main へマージすると Actions がタグを打ってミラーへ積む（「8. 公開リポジトリ（ミラー）」）
 - **いま入っているもの:** ポストエフェクト 8 種（古い映画 / 黒澤モード / モザイク / ビネット / グリッチ / 色収差 / カラーグレーディング / レンズのゆがみ）と、オーディオビジュアライザー用の音の取り口（トラックのミックス / ソース 1 つ。「3. オーディオビジュアライザー」）、シーントランジション「StreamSpook: スティンガー」（「4. スティンガー」）
 - **配り方:** Release の zip を StreamSpook 本体が同梱し、アプリの「OBS プラグイン」ページから OBS のユーザー用プラグインフォルダへ入れる。手で入れることもできる（下）
 - **Streamlabs Desktop にも同じ DLL のまま入る。** フィルタと音の取り口はそのまま動き、スティンガーだけ登録しない。obs-websocket が無いので、話すのは自前の名前付きパイプ（「5. Streamlabs Desktop」）
@@ -48,7 +48,7 @@ pwsh tools/smoke/Run-Smoke.ps1
 
 `.deps` の OBS ソースから `libobs-d3d11` を組み、プラグインを libobs に読み込んで全フィルタを作り（＝ `.effect` を実際にコンパイルし）、2 色のソースに掛けてピクセルを読み戻す（座標をずらすものは境目の色が動くこと、樽型のゆがみは角が透明になることまで見る）。終了コード 0 で OK。シェーダーのエラーは `[obs 300]` 以下の行に出る。`.effect` を触ったら必ず回す。
 
-オーディオビジュアライザー（`src/spectrum.c`）も同じ smoke が見る。obs-websocket は読み込まないので、vendor API の偽物（中身は proc_handler の呼び出しだけ）を先に置いてから、1kHz の正弦波を出すソースを購読し、イベントの帯が正しい位置に立つこと・`unsubscribe` で消えること・期限（6 秒）が切れると止まること・消したソースは受けないことを見る。スティンガー（`src/stinger-transition.c`）は、OBS の画面と同じく private のソースとして作り、`stinger_configure` で設定（行き先ごとの `scenes` を含む）が届いて保存されること・読み直したものは上書きしないこと・長さを固定していないこと・OBS の長さ（1500ms）で回したとき、行き先ごとの設定がある行き先はその切り替え点で、無い行き先は既定の切り替え点で A / B が替わること・ページへ投げる detail（OBS の長さを測った `durationMs`、行き先の比の `pointMs`、`sceneUuid`、`elapsedMs`）・T バー（手動）では行き先の `duration_ms` を使うことを見る（obs-browser は読み込まないので、ページの絵そのものはここでは出ない。detail はスティンガーの proc `stinger_last_event` から読む。読むだけの口）。帯の計算そのもの（`spectrum-analyzer.c`）は libobs 無しの `spectrum-analyzer-test`（CMake の target。配布物には入らない）が先に回る。CI でも回る。
+オーディオビジュアライザー（`src/spectrum.c`）も同じ smoke が見る。obs-websocket は読み込まないので、vendor API の偽物（中身は proc_handler の呼び出しだけ）を先に置いてから、1kHz の正弦波を出すソースを購読し、イベントの帯が正しい位置に立つこと・`unsubscribe` で消えること・期限（6 秒）が切れると止まること・消したソースは受けないことを見る。スティンガー（`src/stinger-transition.c`）は、OBS の画面と同じく private のソースとして作り、`stinger_configure` で設定（行き先ごとの `scenes` を含む）が届いて保存されること・読み直したものは上書きしないこと・長さを固定していないこと・OBS の長さ（1500ms）で回したとき、行き先ごとの設定がある行き先はその切り替え点で、無い行き先は既定の切り替え点で A / B が替わること・ページへ投げる detail（OBS の長さを測った `durationMs`、行き先の比の `pointMs`、`sceneUuid`、`elapsedMs`）・T バー（手動）では行き先の `duration_ms` を使うこと・中のブラウザのモニタリングが既定で「なし」で、`monitoring` の 3 つがそのまま届き、知らない値・省いたとき・持たない保存は「なし」になることを見る（モニタリングは最後に偽の `browser_source` を登録して確かめる）（obs-browser は読み込まないので、ページの絵そのものはここでは出ない。detail はスティンガーの proc `stinger_last_event` から読む。読むだけの口）。帯の計算そのもの（`spectrum-analyzer.c`）は libobs 無しの `spectrum-analyzer-test`（CMake の target。配布物には入らない）が先に回る。CI でも回る。
 
 音量メーター（`src/meters.c`）と、どこに読み込まれたか（`host_info`）も同じ smoke が見る。0.5 の正弦波で peak がおよそ 0.5 になること・購読を外すと消えることまで。
 
@@ -227,6 +227,7 @@ StreamSpook 本体のカスタムオーバーレイにあるビジュアライ�
 
 - **ブラウザソースは作ったときに 1 つだけ作り、ずっと読み込んだままにする**（`shutdown` オフ＋ `obs_source_inc_showing`）。切り替えが始まり、行き先のシーンが決まったら、obs-browser の `javascript_event`（proc_handler）でページへイベント `streamspook:stinger` を投げる（detail は下の表）。毎回ページを読み直さないので、読み込みの待ちが切り替えに乗らない
 - **音はブラウザの音を OBS へ回し（`reroute_audio`）、切り替えの音として配信に乗せる。** シーンの音は標準のスティンガーの「フェードアウト→フェードイン」と同じ（切り替え点までに前を絞り、切り替え点から次を上げる）
+- **配信者の耳にも鳴らせる（0.8.0〜）。** トランジションは音声ミキサーに出ないので、そのままでは配信には乗っても配信者には聞こえない。標準のスティンガーの「音声モニタリング」と同じく、中のブラウザにモニタリングを掛けて、OBS の「設定 → 音声 → モニタリングデバイス」でも鳴らす。3 つとも選べるのは、音の組み方で正解が違うため — デスクトップ音声がモニタリングデバイスと同じ機器を録っている（どちらも「既定」のままがこれ）なら「モニターのみ」（「モニターと出力」だと、モニターの音をデスクトップ音声がもう一度拾って配信に 2 回乗る）、別の機器なら「モニターと出力」。既定は標準のスティンガーと同じ「なし」（いまの配信の音を変えない）
 - **長さは OBS が持つ**（「期間」欄と、シーンごとの「トランジションの上書き」の期間）。固定の長さ（`obs_transition_enable_fixed`）は使わないので、OBS の「期間」欄が出る。本体は行き先のシーンごとに別の演出（長さ・切り替え点）を選べるが、OBS に置くスティンガーは 1 つで、libobs は `transition_start` を行き先を決める**前**に呼んで、その直後に固定の長さを読む。行き先ごとに固定の長さを切り替える隙も、途中で切り上げる公開 API も無いので、長さは本体が OBS に書き込む（既定は「期間」欄、シーンごとは `SetSceneSceneTransitionOverride`）
 - **行き先ごとの切り替え点はプラグインが選ぶ。** 行き先（B）が決まったら（自分の `transition_start` シグナル。libobs が B を置いたあとに出る）、次の `video_tick` でその uuid を `scenes` から探し、無ければ既定の値を使う。切り替え点は `point_ms / duration_ms` の比で、OBS の長さに掛けて使う（0.001..0.999 に丸める）。決まるまでの 1 フレームは前のシーンのまま
 - **実際の長さは測る。** libobs の t（0..1）と同じ時計で 2 フレーム見て「開始からの経過 / t」と「フレーム間の経過 / t の伸び」が合えば、それが OBS の長さ。合わない（スタジオモードの T バー。libobs に今のモードを読む口が無い）・50..60000ms の外・t が 0.5 秒動かない、のときはその行き先の `duration_ms` を使う
@@ -241,10 +242,11 @@ StreamSpook 本体のカスタムオーバーレイにあるビジュアライ�
 | `duration_ms` | 100..20000 | 既定の演出の長さ（`scenes` に無い行き先に使う）。切り替え点の比を出すのと、長さを測れないときの代わりに使う |
 | `point_ms` | 0..duration_ms | 既定の切り替え点（前のシーンから次のシーンへ替える位置。ページの絵が画面を覆っているところ） |
 | `scenes` | `[{ uuid, duration_ms, point_ms }]` | 行き先のシーン（uuid）ごとの長さと切り替え点。範囲は上と同じ。uuid の無いもの・重なった uuid の 2 つ目は落とす（最大 256 件） |
+| `monitoring` | `"none"` \| `"monitor_only"` \| `"monitor_and_output"` | 中のブラウザの音声モニタリング。既定・知らない値・0.7.0 までに保存されたもの（このキーが無い）は `none` |
 
 | 種類 | 名前 | 中身 |
 |---|---|---|
-| 要求 | `stinger_configure` | `{ url, duration_ms, point_ms, scenes?: [{ uuid, duration_ms, point_ms }] }` → `{ count, per_scene: true }`。いまあるスティンガー全部に同じ設定を配り、このあと ＋ から作られるぶん（OBS を再起動するまで）もこの設定で始める。シーンコレクションから読み直したもの（自分の URL を持っている）は上書きしない。`scenes` を省くと空（前に配ったぶんは残さない）。`per_scene` は行き先ごとの切り替え点を知っている版（0.5.0〜）の目印。本体はつなぐたびに呼ぶ |
+| 要求 | `stinger_configure` | `{ url, duration_ms, point_ms, scenes?: [{ uuid, duration_ms, point_ms }], monitoring?: "none" \| "monitor_only" \| "monitor_and_output" }` → `{ count, per_scene: true, monitoring: true }`。いまあるスティンガー全部に同じ設定を配り、このあと ＋ から作られるぶん（OBS を再起動するまで）もこの設定で始める。シーンコレクションから読み直したもの（自分の URL を持っている）は上書きしない。`scenes` を省くと空（前に配ったぶんは残さない）。`per_scene` は行き先ごとの切り替え点を知っている版（0.5.0〜）の目印。`monitoring` を省くと `none`（モニタリングを知らない本体からの要求で、配信の音を変えない）。返事の `monitoring` はモニタリングを知っている版（0.8.0〜）の目印。本体はつなぐたびに呼ぶ |
 | ページへのイベント | `streamspook:stinger` | detail は `{ durationMs, pointMs, sceneUuid, elapsedMs }`。`durationMs` は OBS の実際の長さ（測れないときは行き先の `duration_ms`）、`pointMs` はそれに切り替え点の比を掛けたもの、`sceneUuid` は行き先のシーンの uuid（`scenes` に無くても入る。行き先が無いときは空）、`elapsedMs` は投げた時点で OBS の切り替えが進んでいる量（行き先を決めて長さを測るのに 1〜2 フレーム掛かるので、ページはそのぶん先へ送って OBS と揃える）。切り替えの途中でまた切り替えられたら、決め直してもう一度投げる |
 
 - **vendor は 1 本（`src/vendor.c`）。** 同じ名前の vendor は 1 度しか登録できないので、音の取り口とスティンガーが同じ 1 本に要求を足す
@@ -352,9 +354,9 @@ tools/
 
 ## 7. リリース
 
-1. `buildspec.json` の `version` を上げてコミット
-2. 同じ番号のタグを打つ: `git tag v0.2.0 && git push origin v0.2.0`
-3. GitHub Actions がビルドして Release を作る（`stream-spook-<版>-windows-x64.zip` と `.sha256`）
+1. `buildspec.json` の `version` を上げた PR を作る
+2. main へマージすると、GitHub Actions がビルドして、`v<版>` のタグが無ければそのコミットに打ち、Release を作る（`stream-spook-<版>-windows-x64.zip` と `.sha256`）。版を上げずにマージしたときは、タグが既に別のコミットにあるので何もしない
+3. 手でタグを打っても同じく Release ができる（`git tag v0.2.0 && git push origin v0.2.0`。版と違う番号なら止まる）。main 以外のコミットから出し直したいときだけ使う
 4. StreamSpook 本体の `src-tauri/obs-plugin.json` に版と sha256 を書く。本体のリリースがその zip を取って同梱する
 
 `manifest.json`（`{ "version": "…" }`）と `stream-spook/` の並びは本体の `src-tauri/src/obs_plugin.rs` が読む契約なので、形を変えるときは両方を直す。
@@ -363,7 +365,7 @@ tools/
 
 GPL の「ソースを渡す」義務は、公開用のミラー [Fortyworks/stream-spook-obs-plugin](https://github.com/Fortyworks/stream-spook-obs-plugin) で満たす。こちら（開発用）は非公開のままで、履歴・PR・Actions の実行はここにしか残らない。
 
-タグ `v*` を打つと `build.yml` の `mirror` ジョブが:
+Release を作った実行（main への push で版が新しかったとき、またはタグ `v*` の push）では、`build.yml` の `mirror` ジョブが:
 
 1. そのタグのツリーを `git archive` で取り出し（`.gitattributes` の `export-ignore` でワークフローは外す）、ミラーの `main` に **1 コミット**（メッセージは版の番号）として積んで、同じ番号のタグを打つ。作者は 1 つのアカウント（既定は the40san。メールは GitHub の noreply アドレス）にそろえるので、ミラーの履歴に他の名前は出ない。変えるならリポジトリ変数 `MIRROR_COMMIT_NAME` / `MIRROR_COMMIT_EMAIL`
 2. こちらの Release と**同じ zip / .sha256 をそのまま**ミラーの Release に置く（作り直さない。本体が固定している sha256 が、どちらから取っても一致するように）
