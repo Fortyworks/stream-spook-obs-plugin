@@ -354,9 +354,20 @@ tools/
 
 ## 7. リリース
 
-1. `buildspec.json` の `version` を上げた PR を作る
+### 版の付け方
+
+版は **`<本体の major>.<本体の minor>.<X>`**。X は対応する StreamSpook 本体の major.minor の中でこのプラグインを出した回数で、出すたびに 1 つ上げる。
+
+- 本体が 1.0.x のあいだに出す版は 1.0.0 → 1.0.1 → 1.0.2 …。本体のパッチではこちらの版は動かさない
+- **本体の minor / major が上がったら、こちらに変更が無くても `<major>.<minor>.0` で出し直す**（本体 1.1.0 → プラグイン 1.1.0）。X は 0 に戻る。版の頭 2 桁で、どの本体と組みになっているかが分かるようにするため
+- 0.x（0.8.0 まで）はこの決まりを作る前の版。本体 1.0 のあいだは 0.x のまま出していたので 1.0.x は飛ばし、最初の版は本体 1.1.0 と組みになる 1.1.0
+- 本体側は `package.json` と `src-tauri/obs-plugin.json` の頭 2 桁がそろっているかをテストで見ている（本体の `docs/obs-plugin.md`「プラグインの版の付け方」）
+
+### 手順
+
+1. `buildspec.json` の `version` を上の付け方で上げた PR を作る
 2. main へマージすると、GitHub Actions がビルドして、`v<版>` のタグが無ければそのコミットに打ち、Release を作る（`stream-spook-<版>-windows-x64.zip` と `.sha256`）。版を上げずにマージしたときは、タグが既に別のコミットにあるので何もしない
-3. 手でタグを打っても同じく Release ができる（`git tag v0.2.0 && git push origin v0.2.0`。版と違う番号なら止まる）。main 以外のコミットから出し直したいときだけ使う
+3. 手でタグを打っても同じく Release ができる（`git tag v1.0.0 && git push origin v1.0.0`。版と違う番号なら止まる）。main 以外のコミットから出し直したいときだけ使う
 4. StreamSpook 本体の `src-tauri/obs-plugin.json` に版と sha256 を書く。本体のリリースがその zip を取って同梱する
 
 `manifest.json`（`{ "version": "…" }`）と `stream-spook/` の並びは本体の `src-tauri/src/obs_plugin.rs` が読む契約なので、形を変えるときは両方を直す。
