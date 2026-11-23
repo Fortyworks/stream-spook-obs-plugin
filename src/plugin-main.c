@@ -25,6 +25,7 @@
 
 #include "host.h"
 #include "meters.h"
+#include "program-frames.h"
 #include "spectrum.h"
 #include "stinger-transition.h"
 #include "vendor.h"
@@ -72,7 +73,7 @@ bool obs_module_load(void)
 
 /* どこに読み込まれていて、何が使えるか。アプリはつないだら最初にこれを聞く
  * （Streamlabs Desktop ではスティンガーが無い、など）。
- *   → { version, host: "obs" | "streamlabs", libobs, features: { stinger, meters, spectrum } } */
+ *   → { version, host: "obs" | "streamlabs", libobs, features: { stinger, meters, spectrum, frames } } */
 static void req_host_info(obs_data_t *req, obs_data_t *res, void *priv)
 {
 	UNUSED_PARAMETER(req);
@@ -84,6 +85,7 @@ static void req_host_info(obs_data_t *req, obs_data_t *res, void *priv)
 	obs_data_set_bool(features, "stinger", stinger_available());
 	obs_data_set_bool(features, "meters", true);
 	obs_data_set_bool(features, "spectrum", true);
+	obs_data_set_bool(features, "frames", program_frames_available());
 	obs_data_set_obj(res, "features", features);
 	obs_data_release(features);
 }
@@ -96,6 +98,7 @@ void obs_module_post_load(void)
 		ss_vendor_register_request("host_info", req_host_info, NULL);
 	spectrum_init();
 	meters_init();
+	program_frames_init();
 	stinger_init_vendor();
 	/* 要求が全部そろってから口を開く（Streamlabs Desktop のときだけ） */
 	ss_vendor_open_pipe();
@@ -107,6 +110,7 @@ void obs_module_unload(void)
 	ss_vendor_shutdown();
 	spectrum_shutdown();
 	meters_shutdown();
+	program_frames_shutdown();
 	stinger_shutdown();
 	obs_log(LOG_INFO, "plugin unloaded");
 }

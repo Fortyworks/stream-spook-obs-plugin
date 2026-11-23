@@ -3,10 +3,11 @@
 [StreamSpook](https://streamspook.app) が OBS の中で受け持つぶん ―― 配信画面そのものに掛けるポストエフェクトや、OBS の中を流れる音など、ブラウザソースのオーバーレイでは届かないもの ―― のネイティブプラグイン。モジュール名は `stream-spook`、土台は [obs-plugintemplate](https://github.com/obsproject/obs-plugintemplate)。
 
 - **ライセンス: GPL-2.0-or-later**（[LICENSE](./LICENSE)）。libobs が GPL-2.0-or-later で、そのヘッダのコード（マクロ・`static inline`）がこの DLL に直接含まれるため。StreamSpook 本体とは別のプログラムで、話すのは obs-websocket の JSON だけ
-- **公開しているのは [Fortyworks/stream-spook-obs-plugin](https://github.com/Fortyworks/stream-spook-obs-plugin)。** リリースごとのスナップショット（1 版 = 1 コミット）で、開発の履歴と PR は入っていない。開発は非公開のリポジトリで行い、版を上げて main へマージすると Actions がタグを打ってミラーへ積む（「8. 公開リポジトリ（ミラー）」）
-- **いま入っているもの:** ポストエフェクト 8 種（古い映画 / 黒澤モード / モザイク / ビネット / グリッチ / 色収差 / カラーグレーディング / レンズのゆがみ）と、オーディオビジュアライザー用の音の取り口（トラックのミックス / ソース 1 つ。「3. オーディオビジュアライザー」）、シーントランジション「StreamSpook: スティンガー」（「4. スティンガー」）
+- **よそから写したもの:** `src/obs-websocket-api.h`（obs-websocket。GPL-2.0-or-later）と `src/third_party/stb_image_write.h`（[stb](https://github.com/nothings/stb) の v1.18。public domain / MIT のどちらかを選べる。本文はファイルの末尾）。どちらも手を入れずにそのまま置く
+- **公開しているのは [Fortyworks/stream-spook-obs-plugin](https://github.com/Fortyworks/stream-spook-obs-plugin)。** リリースごとのスナップショット（1 版 = 1 コミット）で、開発の履歴と PR は入っていない。開発は非公開のリポジトリで行い、版を上げて main へマージすると Actions がタグを打ってミラーへ積む（「9. 公開リポジトリ（ミラー）」）
+- **いま入っているもの:** ポストエフェクト 8 種（古い映画 / 黒澤モード / モザイク / ビネット / グリッチ / 色収差 / カラーグレーディング / レンズのゆがみ）と、オーディオビジュアライザー用の音の取り口（トラックのミックス / ソース 1 つ。「3. オーディオビジュアライザー」）、シーントランジション「StreamSpook: スティンガー」（「4. スティンガー」）、アプリのお絵かきレイヤーの下に敷く配信画面の絵（「5. 配信画面の絵」）
 - **配り方:** Release の zip を StreamSpook 本体が同梱し、アプリの「OBS プラグイン」ページから OBS のユーザー用プラグインフォルダへ入れる。手で入れることもできる（下）
-- **Streamlabs Desktop にも同じ DLL のまま入る。** フィルタと音の取り口はそのまま動き、スティンガーだけ登録しない。obs-websocket が無いので、話すのは自前の名前付きパイプ（「5. Streamlabs Desktop」）
+- **Streamlabs Desktop にも同じ DLL のまま入る。** フィルタと音の取り口はそのまま動き、スティンガーと配信画面の絵は登録しない。obs-websocket が無いので、話すのは自前の名前付きパイプ（「6. Streamlabs Desktop」）
 
 ## 1. ビルド（Windows）
 
@@ -38,7 +39,7 @@ cmake --install build_x64 --config RelWithDebInfo --prefix "$env:ProgramData\obs
 
 - OBS が起動中だと DLL の上書きに失敗する（初回の新規コピーは通る）
 - ポータブルモードの OBS は `ProgramData` を見ないので、この置き場所では読まれない
-- Streamlabs Desktop は置き場所が違う（「5. Streamlabs Desktop」）
+- Streamlabs Desktop は置き場所が違う（「6. Streamlabs Desktop」）
 
 ### OBS を起動せずに確かめる（smoke）
 
@@ -52,11 +53,13 @@ pwsh tools/smoke/Run-Smoke.ps1
 
 音量メーター（`src/meters.c`）と、どこに読み込まれたか（`host_info`）も同じ smoke が見る。0.5 の正弦波で peak がおよそ 0.5 になること・購読を外すと消えることまで。
 
+配信画面の絵（`src/program-frames.c`）も同じ smoke が見る。`obs_reset_video` が立てる本物の描画のスレッドの上で回すので、描画コールバック → 読み戻し → JPEG → base64 の道を全部通る。幅の丸め（160 / 偶数）と高さ・`frame_get` が JPEG（頭が `FF D8`、尻が `FF D9`）を返すこと・`since` より新しくなければ載せないこと・出力に色のソースを置くと絵が変わること・1 秒でおよそ 30 枚（超えず、1 枚おきにも落ちない）・private の縦のキャンバス（1080x1920）を uuid で取れること・3 つ目は `busy`・知らない uuid は `no_canvas`・`unsubscribe` ですぐ止まり、期限（6 秒）で畳まれて枠が空くことまで。`-Streamlabs` では登録していないこと（`features.frames` が false）を見る。
+
 ```powershell
 pwsh tools/smoke/Run-Smoke.ps1 -Streamlabs
 ```
 
-`-Streamlabs` を付けると、**同じ DLL を Streamlabs Desktop の libobs（独自のフォーク）に読み込んで**回す。Streamlabs が配っている libobs 一式（ヘッダ・`obs.lib`・DLL）を `tools/smoke/streamlabs.json` の版と sha256 で `.deps` に落とし（約 155MB、初回だけ）、smoke.exe だけをフォークのヘッダで組み直す。プラグインは組み直さない（配る DLL 1 つで両方に入る、を確かめるのが目的）。フィルタ・音の取り口・音量メーターに加えて、スティンガーを登録していないこと、パイプにつないで要求とイベントが通ること、切ってつなぎ直せることを見る。Streamlabs が libobs を上げたら `streamlabs.json` を上げて回す（版は obs-studio-node の `.github/workflows/main.yml` の `LibOBSVersion`）。
+`-Streamlabs` を付けると、**同じ DLL を Streamlabs Desktop の libobs（独自のフォーク）に読み込んで**回す。Streamlabs が配っている libobs 一式（ヘッダ・`obs.lib`・DLL）を `tools/smoke/streamlabs.json` の版と sha256 で `.deps` に落とし（約 155MB、初回だけ）、smoke.exe だけをフォークのヘッダで組み直す。プラグインは組み直さない（配る DLL 1 つで両方に入る、を確かめるのが目的）。フィルタ・音の取り口・音量メーターに加えて、スティンガーと配信画面の絵を登録していないこと、パイプにつないで要求とイベントが通ること、切ってつなぎ直せることを見る。Streamlabs が libobs を上げたら `streamlabs.json` を上げて回す（版は obs-studio-node の `.github/workflows/main.yml` の `LibOBSVersion`）。
 
 ### 文言の見張り
 
@@ -218,7 +221,7 @@ StreamSpook 本体のカスタムオーバーレイにあるビジュアライ�
 - **帯の切り方は本体の PC 音の経路と同じ**（2048 点・64 帯・30Hz〜16kHz の対数・底 -70dB・+2.5dB/oct の持ち上げ）。切り替えても同じ曲で棒の高さが変わらないようにするため。値を変えるときは本体の `src-tauri/src/spectrum.rs` と対で直す
 - **無音は 1 回だけ流す。** 全部 0 の配列を送り続けない。音が来ないまま止まっている取り口は 120ms で 0 を詰めて落とす
 - **誰も見ていないときは動かない。** 期限が切れた取り口は畳み、取り口が 1 つも無いあいだスレッドは 100ms おきに起きて何もしない
-- **Streamlabs Desktop では同じ要求とイベントが名前付きパイプを通る**（「5. Streamlabs Desktop」）
+- **Streamlabs Desktop では同じ要求とイベントが名前付きパイプを通る**（「6. Streamlabs Desktop」）
 - **`obs-websocket-api.h` は obs-websocket のリポジトリから写したもの**（GPL-2.0-or-later、`src/obs-websocket-api.h`）。リンクは要らない（proc_handler を引くだけ）。obs-websocket が無ければ `obs_websocket_register_vendor` が NULL を返すので、フィルタだけで動く
 
 ## 4. スティンガー（シーントランジション）
@@ -250,9 +253,28 @@ StreamSpook 本体のカスタムオーバーレイにあるビジュアライ�
 | ページへのイベント | `streamspook:stinger` | detail は `{ durationMs, pointMs, sceneUuid, elapsedMs }`。`durationMs` は OBS の実際の長さ（測れないときは行き先の `duration_ms`）、`pointMs` はそれに切り替え点の比を掛けたもの、`sceneUuid` は行き先のシーンの uuid（`scenes` に無くても入る。行き先が無いときは空）、`elapsedMs` は投げた時点で OBS の切り替えが進んでいる量（行き先を決めて長さを測るのに 1〜2 フレーム掛かるので、ページはそのぶん先へ送って OBS と揃える）。切り替えの途中でまた切り替えられたら、決め直してもう一度投げる |
 
 - **vendor は 1 本（`src/vendor.c`）。** 同じ名前の vendor は 1 度しか登録できないので、音の取り口とスティンガーが同じ 1 本に要求を足す
-- **Streamlabs Desktop では登録しない**（「5. Streamlabs Desktop」）
+- **Streamlabs Desktop では登録しない**（「6. Streamlabs Desktop」）
 
-## 5. Streamlabs Desktop
+## 5. 配信画面の絵（お絵かきレイヤーの下敷き）
+
+StreamSpook 本体の「お絵かきレイヤー」は、配信者が描いた絵を配信画面へ重ねる。描くキャンバスの下にいまの配信画面（プログラム出力）を敷くために、その絵を小さな JPEG にして渡す。obs-websocket の `GetSourceScreenshot` でも取れるが、毎回その場で読み戻す（OBS の描画のスレッドが GPU を待つ）ので、続けて何枚も取るには重い。本体はこの要求が無い版では `GetSourceScreenshot` に戻るので、足すだけで何も壊さない。
+
+| 種類 | 名前 | 中身 |
+|---|---|---|
+| 要求 | `frame_subscribe` | `{ canvas?, width }` → `{ active, reason?, width, height }`。取り始める。**呼ぶたびに期限が 6 秒延びる**（本体は見ているあいだ 2 秒おきに呼ぶ）。`width` は 160..1280 に丸め、高さはキャンバスの縦横比から出す（どちらも偶数）。幅を変えて呼び直すと大きさが変わる。`reason` は `busy`（同時に 2 つまで）/ `no_canvas`（その uuid が無い・映像を持たない） |
+| 要求 | `frame_unsubscribe` | `{ canvas? }` → `{}`。すぐ畳む |
+| 要求 | `frame_get` | `{ canvas?, since? }` → `{ active, seq, width, height, jpeg? }`。いちばん新しい 1 枚を写して返すだけで待たない。`seq` は 1 枚できるたびに 1 つ上がる（1 から。0 はまだ無い）。`jpeg`（base64。`data:` は付けない）は `seq > since` のときだけ載せる。取っていなければ `{ active: false, seq: 0, width: 0, height: 0 }` |
+
+- **`canvas` は OBS 31 からのキャンバスの uuid**（縦の 9:16 など）。省くか空ならメインのキャンバス。取り口はキャンバスごとに 1 つで、メインを uuid で名指ししたものは `""` とは別に数える
+- **描き直さない。** `obs_add_main_rendered_callback` で、描き終わった絵（メインは `obs_render_main_texture`、ほかのキャンバスは `obs_render_canvas_texture`）を小さな texrender へ写すだけ。プロジェクターのようにシーンをもう一度描かない
+- **描画のスレッドで GPU を待たない。** 写したものは `gs_stage_texture` で読み戻しの箱へ送り、次の回に map する（箱は 2 つを交互に使う）。JPEG（品質 70、stb_image_write）と base64 は自前のスレッドでやる。間に合わなければ古い画素は捨てる
+- **1 秒に 30 枚まで。** 取る時刻は予定から数えるので、OBS が 60fps でも 30 枚、30fps でも描画の揺れで 1 枚おきに落ちない
+- **色は sRGB（SDR）。** texrender を `GS_CS_SRGB` で開くので、HDR のキャンバスは libobs がトーンマップする。透けているところは黒になる（JPEG に透明は無い）
+- **誰も取っていないときは動かない。** 描画コールバックは登録したままだが、取り口が無いあいだは錠も取らずに戻る。期限が切れた・キャンバスが消された取り口は自前のスレッドが 0.5 秒おきに見回って畳む
+- **キャンバスの関数は `obs.dll` から名前で引く。** 直に呼ぶと、キャンバスを知らない版の OBS ではこの DLL ごと読み込めなくなる（フィルタも道連れになる）。引けなければメインのキャンバスだけを受ける
+- **Streamlabs Desktop では登録しない**（「6. Streamlabs Desktop」）。`host_info` の `features.frames` が false になる
+
+## 6. Streamlabs Desktop
 
 Streamlabs Desktop は libobs を独自にフォークして使っている（obs-studio-node。いまは `32.1.1sl12`）。このプラグインは**同じ DLL のまま**そちらにも入る。
 
@@ -262,6 +284,7 @@ Streamlabs Desktop は libobs を独自にフォークして使っている（ob
 | 音の取り口（`spectrum_*`） | そのまま動く（パイプ経由） |
 | 音量メーター（`meters_*`） | Streamlabs のためにある（下） |
 | スティンガー | **登録しない** |
+| 配信画面の絵（`frame_*`） | **登録しない** |
 
 ### 置き場所
 
@@ -279,6 +302,10 @@ Streamlabs を再起動すると読まれる。Mac 版は同梱のプラグイ�
 フォークは `obs_source_info` の `audio_render` の直後に `audio_render_do` を 1 つ挿し込んでいて、OBS の SDK で組んだこの DLL とは、それより後ろの項目が 1 つずつずれる。フィルタが使う項目は全部それより前なので影響しないが、スティンガーは後ろの `enum_all_sources` / `transition_start` / `transition_stop` / `video_get_color_space` を使うので、別の関数として呼ばれて**作った瞬間に落ちる**（`obs_video_info` も頭に項目が足されていて、`obs_get_video_info` が受け皿の外まで書く）。Streamlabs の画面はプラグインのトランジションを選ばせもしないので、登録しない。
 
 見分け方は `src/host.c`。フォークにしか無い関数（`obs_get_video_info_count`）が `obs.dll` から引けるかで見る（版の文字列は作り方しだいで変わるので当てにしない）。**フォークの構造体の並びが変わったら、ここに書いたことを見直す。** smoke の `-Streamlabs` が落ちるのがその合図。
+
+### 配信画面の絵を登録しない理由
+
+フォークは `obs_video_info` の頭に項目を足していて（上）、ここでは基準の大きさを読むのに `obs_get_video_info` を使う。キャンバスの作りもフォーク独自で、smoke で回して確かめる手段も無いので、出さない。本体は `features.frames` を見て、お絵かきレイヤーの下に絵を敷かない（`GetSourceScreenshot` も無いので）。
 
 ### 話し方（名前付きパイプ）
 
@@ -300,7 +327,7 @@ Streamlabs Desktop には obs-websocket が入っていないので、**Streamla
 
 | 種類 | 名前 | 中身 |
 |---|---|---|
-| 要求 | `host_info` | → `{ version, host: "obs" \| "streamlabs", libobs, features: { stinger, meters, spectrum } }`。アプリはつないだら最初にこれを聞いて、使えないもの（Streamlabs のスティンガー）を出さない |
+| 要求 | `host_info` | → `{ version, host: "obs" \| "streamlabs", libobs, features: { stinger, meters, spectrum, frames } }`。アプリはつないだら最初にこれを聞いて、使えないもの（Streamlabs のスティンガー・配信画面の絵）を出さない |
 | 要求 | `meters_subscribe` | `{ keys: [{ key: "input-<uuid>" }] }` → `{ active, rejected }`。鍵と期限（6 秒）の扱いは `spectrum_subscribe` と同じ |
 | 要求 | `meters_unsubscribe` | `{ keys: [{ key }] }` → `{}` |
 | イベント | `meters` | `{ inputs: [{ k, levels: [{ m, p, i }] }] }`。毎秒 20 回（obs-websocket の `InputVolumeMeters` と同じ 50ms おき）。`levels` はチャンネルごと、値は倍率（0..1）で、`m` = magnitude（RMS）・`p` = peak・`i` = フェーダーを通る前の peak。新しい値が届いた取り口だけを載せる |
@@ -308,7 +335,7 @@ Streamlabs Desktop には obs-websocket が入っていないので、**Streamla
 - **音量メーターは Streamlabs のためにある。** OBS Studio では obs-websocket の `InputVolumeMeters` が同じものを流すので、本体はそちらを使う（要求は OBS でも登録されるが、呼ばれない）。Streamlabs Desktop の API には音量を外へ出す口が無く、音量ミキサーの提案・自動調整、マイク調整の計測、無言アラートがこれを読む
 - **取り方は libobs の volmeter**（OBS のミキサーの棒と同じもの。`OBS_FADER_LOG`）。ソースの一覧は `spectrum_sources` を使う。Streamlabs のソース ID は libobs のソース名そのもの（`InputFactory.create(type, id, …)`）なので、本体は名前で突き合わせられる
 
-## 6. つくり
+## 7. つくり
 
 ```
 buildspec.json        名前・版・依存の版（版を上げるのはここだけ。Release のタグと一致させる）
@@ -325,6 +352,8 @@ src/
   spectrum-analyzer.{h,c}  帯の計算（libobs に依存しない。単体で確かめられる）
   stinger-transition.{h,c} シーントランジション「スティンガー」（ブラウザソースを重ねる）
   meters.{h,c}        音量メーター（Streamlabs Desktop 向け。vendor の要求・購読・期限）
+  program-frames.{h,c} 配信画面の絵を小さな JPEG にして渡す（お絵かきレイヤーの下敷き。vendor の要求・購読・期限）
+  third_party/stb_image_write.{h,c} JPEG の符号化（stb の写し。.c は実体を 1 回組むだけ）
   host.{h,c}          読み込まれた先が OBS か Streamlabs Desktop かを見分ける
   vendor.{h,c}        アプリと話す口をまとめる（obs-websocket の vendor と、Streamlabs ではパイプ）
   pipe.{h,c}          Streamlabs Desktop で開く名前付きパイプ（\\.\pipe\stream-spook）
@@ -352,7 +381,7 @@ tools/
 - **音は取るだけで、描かない。** 帯の強さを出すところまでがここの仕事で、棒の描き方・追従・色は本体のオーバーレイが持つ。鍵の形（`track-<n>` / `input-<uuid>`）とイベントの形は一度決めたら変えない（本体が名指しで叩く）
 - **秘密にしたいものを置かない。** このリポジトリは GPL で全部公開される。独自のロジックは StreamSpook 本体に置き、ここは「OBS の中でしかできないこと」を薄く受け持つ。本体のコードをここへ写さない（GPL になる）し、ここのコードを本体へ写さない（本体が GPL の派生物になる）
 
-## 7. リリース
+## 8. リリース
 
 ### 版の付け方
 
@@ -372,7 +401,7 @@ tools/
 
 `manifest.json`（`{ "version": "…" }`）と `stream-spook/` の並びは本体の `src-tauri/src/obs_plugin.rs` が読む契約なので、形を変えるときは両方を直す。
 
-## 8. 公開リポジトリ（ミラー）
+## 9. 公開リポジトリ（ミラー）
 
 GPL の「ソースを渡す」義務は、公開用のミラー [Fortyworks/stream-spook-obs-plugin](https://github.com/Fortyworks/stream-spook-obs-plugin) で満たす。こちら（開発用）は非公開のままで、履歴・PR・Actions の実行はここにしか残らない。
 

@@ -34,6 +34,12 @@
  * libobs の volmeter（OBS のミキサーの棒と同じもの）をソースに付け、コールバックで
  * 届いた最新の値だけを覚えておく。送るのは自前の tick スレッドで、届いていない
  * 取り口は載せない。期限が切れた取り口は畳む（アプリが落ちても数秒で止まる）。
+ *
+ * ─── M.mutex の下で OBS のソース一覧に触らない ─────────────────────────────
+ * spectrum.c と同じ理由（あちらの頭を参照）。OBS はソース一覧のロックを持ったまま
+ * "source_remove" を流し、on_source_remove は M.mutex を取る。M.mutex を持ったまま
+ * obs_get_source_by_uuid / 最後の obs_source_release を呼ぶと逆順になって固まるので、
+ * 引き当てはロックの前、参照を返すのはロックの後にする（release_list）。
  */
 #include "meters.h"
 
@@ -41,6 +47,7 @@
 #include <util/platform.h>
 #include <util/threading.h>
 
+#include <assert.h>
 #include <math.h>
 #include <string.h>
 
@@ -111,6 +118,30 @@ static void on_levels(void *param, const float magnitude[MAX_AUDIO_CHANNELS], co
 	pthread_mutex_unlock(&m->level_mutex);
 }
 
+/* ─── ロックの外で返す参照 ────────────────────────────────────────────────── */
+
+/* M.mutex の下で手放したソースの参照。外してから release_flush で返す */
+struct release_list {
+	obs_source_t *items[MAX_TAPS];
+	size_t count;
+};
+
+static void release_push(struct release_list *rl, obs_source_t *src)
+{
+	/* 1 回のロックで畳めるのは多くても取り口の数（MAX_TAPS）ぶん */
+	assert(rl->count < MAX_TAPS);
+	if (src && rl->count < MAX_TAPS)
+		rl->items[rl->count++] = src;
+}
+
+/* M.mutex を外してから呼ぶ */
+static void release_flush(struct release_list *rl)
+{
+	for (size_t i = 0; i < rl->count; i++)
+		obs_source_release(rl->items[i]);
+	rl->count = 0;
+}
+
 /* ─── 取り口の出し入れ（M.mutex の下で） ──────────────────────────────────── */
 
 static struct meter *meter_find(const char *key)
@@ -121,39 +152,41 @@ static struct meter *meter_find(const char *key)
 	return NULL;
 }
 
-static void meter_destroy(struct meter *m)
+/* ソースの参照は rl に移すだけで、ここでは返さない */
+static void meter_destroy(struct meter *m, struct release_list *rl)
 {
 	/* remove_callback は走っている最中のコールバックが終わるまで待つ */
 	obs_volmeter_remove_callback(m->volmeter, on_levels, m);
 	obs_volmeter_detach_source(m->volmeter);
 	obs_volmeter_destroy(m->volmeter);
-	obs_source_release(m->source);
+	release_push(rl, m->source);
 	pthread_mutex_destroy(&m->level_mutex);
 	bfree(m);
 }
 
-static void meter_drop_at(size_t i)
+static void meter_drop_at(size_t i, struct release_list *rl)
 {
 	struct meter *m = M.meters[i];
 	for (size_t j = i + 1; j < M.count; j++)
 		M.meters[j - 1] = M.meters[j];
 	M.count--;
-	meter_destroy(m);
+	meter_destroy(m, rl);
 }
 
-/* 鍵から取り口を作る。だめなら理由を返し、できたら NULL */
-static const char *meter_create(const char *key, uint64_t now)
+/* 鍵から取り口を作る。だめなら理由を返し、できたら NULL。
+ * ソースは呼ぶ側が M.mutex の前に引いて *src_io で渡す。取り口が参照を
+ * 持っていったら *src_io を NULL にする。残ったぶんは呼ぶ側がロックの外で返す */
+static const char *meter_create(const char *key, uint64_t now, obs_source_t **src_io)
 {
 	if (M.count >= MAX_TAPS)
 		return "full";
 	if (strncmp(key, "input-", 6) != 0)
 		return "unknown";
-	obs_source_t *src = obs_get_source_by_uuid(key + 6);
+	obs_source_t *src = *src_io;
 	if (!src)
 		return "unknown";
 	if (obs_source_removed(src) || obs_source_get_type(src) != OBS_SOURCE_TYPE_INPUT ||
 	    !(obs_source_get_output_flags(src) & OBS_SOURCE_AUDIO)) {
-		obs_source_release(src);
 		return "not_audio";
 	}
 
@@ -168,11 +201,11 @@ static const char *meter_create(const char *key, uint64_t now)
 	if (!obs_volmeter_attach_source(m->volmeter, src)) {
 		obs_volmeter_remove_callback(m->volmeter, on_levels, m);
 		obs_volmeter_destroy(m->volmeter);
-		obs_source_release(src);
 		pthread_mutex_destroy(&m->level_mutex);
 		bfree(m);
 		return "not_audio";
 	}
+	*src_io = NULL; /* 参照は取り口が持つ。meter_destroy で手放す */
 	M.meters[M.count++] = m;
 	return NULL;
 }
@@ -208,11 +241,12 @@ static void tick(void)
 {
 	const uint64_t now = os_gettime_ns();
 	obs_data_array_t *inputs = NULL;
+	struct release_list rl = {0};
 
 	pthread_mutex_lock(&M.mutex);
 	for (size_t i = M.count; i-- > 0;) {
 		if (M.meters[i]->removed || now > M.meters[i]->lease_until_ns)
-			meter_drop_at(i);
+			meter_drop_at(i, &rl);
 	}
 	for (size_t i = 0; i < M.count; i++) {
 		struct meter *m = M.meters[i];
@@ -233,6 +267,8 @@ static void tick(void)
 		pthread_mutex_unlock(&m->level_mutex);
 	}
 	pthread_mutex_unlock(&M.mutex);
+	/* 最後の参照ならここでソースの破棄が走る。ロックの外で */
+	release_flush(&rl);
 
 	if (!inputs)
 		return;
@@ -279,6 +315,17 @@ static void req_subscribe(obs_data_t *req, obs_data_t *res, void *priv)
 	obs_data_array_t *rejected = obs_data_array_create();
 	const uint64_t now = os_gettime_ns();
 
+	/* uuid の引き当てはソース一覧のロックを取るので、M.mutex の前に済ませる。
+	 * 取り口がもうあって使わなかったぶんは、外してからまとめて返す */
+	obs_source_t **srcs = n ? bzalloc(n * sizeof(*srcs)) : NULL;
+	for (size_t i = 0; i < n; i++) {
+		obs_data_t *item = obs_data_array_item(keys, i);
+		const char *key = obs_data_get_string(item, "key");
+		if (key && strlen(key) < KEY_MAX && strncmp(key, "input-", 6) == 0)
+			srcs[i] = obs_get_source_by_uuid(key + 6);
+		obs_data_release(item);
+	}
+
 	pthread_mutex_lock(&M.mutex);
 	for (size_t i = 0; i < n; i++) {
 		obs_data_t *item = obs_data_array_item(keys, i);
@@ -291,7 +338,7 @@ static void req_subscribe(obs_data_t *req, obs_data_t *res, void *priv)
 			if (m)
 				reason = m->removed ? "unknown" : NULL;
 			else
-				reason = meter_create(key, now);
+				reason = meter_create(key, now, &srcs[i]);
 			if (m && !reason)
 				m->lease_until_ns = now + MS_TO_NS(LEASE_MS);
 		}
@@ -299,6 +346,10 @@ static void req_subscribe(obs_data_t *req, obs_data_t *res, void *priv)
 		obs_data_release(item);
 	}
 	pthread_mutex_unlock(&M.mutex);
+
+	for (size_t i = 0; i < n; i++)
+		obs_source_release(srcs[i]);
+	bfree(srcs);
 
 	obs_data_set_array(res, "active", active);
 	obs_data_set_array(res, "rejected", rejected);
@@ -314,6 +365,7 @@ static void req_unsubscribe(obs_data_t *req, obs_data_t *res, void *priv)
 	UNUSED_PARAMETER(priv);
 	obs_data_array_t *keys = obs_data_get_array(req, "keys");
 	const size_t n = keys ? obs_data_array_count(keys) : 0;
+	struct release_list rl = {0};
 
 	pthread_mutex_lock(&M.mutex);
 	for (size_t i = 0; i < n; i++) {
@@ -321,13 +373,14 @@ static void req_unsubscribe(obs_data_t *req, obs_data_t *res, void *priv)
 		const char *key = obs_data_get_string(item, "key");
 		for (size_t j = 0; key && j < M.count; j++) {
 			if (strcmp(M.meters[j]->key, key) == 0) {
-				meter_drop_at(j);
+				meter_drop_at(j, &rl);
 				break;
 			}
 		}
 		obs_data_release(item);
 	}
 	pthread_mutex_unlock(&M.mutex);
+	release_flush(&rl);
 	if (keys)
 		obs_data_array_release(keys);
 }
@@ -376,9 +429,11 @@ void meters_shutdown(void)
 	if (M.enabled)
 		signal_handler_disconnect(obs_get_signal_handler(), "source_remove", on_source_remove, NULL);
 
+	struct release_list rl = {0};
 	pthread_mutex_lock(&M.mutex);
 	while (M.count > 0)
-		meter_drop_at(M.count - 1);
+		meter_drop_at(M.count - 1, &rl);
 	pthread_mutex_unlock(&M.mutex);
+	release_flush(&rl);
 	pthread_mutex_destroy(&M.mutex);
 }

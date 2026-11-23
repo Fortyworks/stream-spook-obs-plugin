@@ -54,6 +54,16 @@
  * 短いロックで書き、解析と送信は自前の tick スレッドがやる。取り口の出し入れは
  * S.mutex の下でだけ行い、外す前に libobs 側のコールバック登録を必ず解く
  * （どちらの remove も、走っている最中のコールバックが終わるまで待ってくれる）。
+ *
+ * ─── S.mutex の下で OBS のソース一覧に触らない ─────────────────────────────
+ * OBS は、ソース一覧のロック（obs->data.sources_mutex）を持ったまま "source_remove"
+ * を流してくる（シーンコレクションの片付け・終了。obs_enum_sources の中で
+ * obs_source_remove を呼ぶ）。それを受ける on_source_remove は S.mutex を取るので、
+ * 順番は「一覧 → S.mutex」。S.mutex を持ったまま一覧のロックを取りに行くと逆順に
+ * なって、両方が待ち合ったまま OBS ごと固まる。一覧のロックを取るのは次の 2 つ:
+ *   - obs_get_source_by_uuid（uuid の引き当て）     … ロックを取る前に済ませる
+ *   - obs_source_release（最後の参照なら破棄が走る） … ロックを外してから返す
+ * S.mutex の下で手放す参照は release_list に溜めて、外してから release_flush で返す。
  */
 #include "spectrum.h"
 
@@ -206,6 +216,31 @@ static void on_track_audio(void *param, size_t mix_idx, struct audio_data *audio
 	tap_feed(param, audio, false);
 }
 
+/* ─── ロックの外で返す参照 ────────────────────────────────────────────────── */
+
+/* S.mutex の下で手放したソースの参照。外してから release_flush で返す
+ * （理由はファイルの頭の「S.mutex の下で OBS のソース一覧に触らない」） */
+struct release_list {
+	obs_source_t *items[MAX_TAPS];
+	size_t count;
+};
+
+static void release_push(struct release_list *rl, obs_source_t *src)
+{
+	/* 1 回のロックで畳めるのは多くても取り口の数（MAX_TAPS）ぶん */
+	assert(rl->count < MAX_TAPS);
+	if (src && rl->count < MAX_TAPS)
+		rl->items[rl->count++] = src;
+}
+
+/* S.mutex を外してから呼ぶ */
+static void release_flush(struct release_list *rl)
+{
+	for (size_t i = 0; i < rl->count; i++)
+		obs_source_release(rl->items[i]);
+	rl->count = 0;
+}
+
 /* ─── 取り口の出し入れ（S.mutex の下で） ──────────────────────────────────── */
 
 static struct tap *tap_find(const char *key)
@@ -217,8 +252,9 @@ static struct tap *tap_find(const char *key)
 }
 
 /* 登録を解いて返す。remove はどちらも、走っている最中のコールバックが
- * 終わるまで待つので、戻ってきたら tap を触るものは居ない */
-static void tap_destroy(struct tap *t)
+ * 終わるまで待つので、戻ってきたら tap を触るものは居ない。
+ * ソースの参照は rl に移すだけで、ここでは返さない */
+static void tap_destroy(struct tap *t, struct release_list *rl)
 {
 	if (t->kind == TAP_TRACK) {
 		/* obs_reset_audio で audio が作り直されていたら、登録は向こうと一緒に消えている */
@@ -226,29 +262,31 @@ static void tap_destroy(struct tap *t)
 			obs_remove_raw_audio_callback(t->mix_idx, on_track_audio, t);
 	} else {
 		obs_source_remove_audio_capture_callback(t->source, on_source_audio, t);
-		obs_source_release(t->source);
+		release_push(rl, t->source);
 	}
 	pthread_mutex_destroy(&t->ring_mutex);
 	bfree(t);
 }
 
-static void tap_drop_at(size_t i)
+static void tap_drop_at(size_t i, struct release_list *rl)
 {
 	struct tap *t = S.taps[i];
 	for (size_t j = i + 1; j < S.count; j++)
 		S.taps[j - 1] = S.taps[j];
 	S.count--;
-	tap_destroy(t);
+	tap_destroy(t, rl);
 }
 
-static void tap_drop_all(void)
+static void tap_drop_all(struct release_list *rl)
 {
 	while (S.count > 0)
-		tap_drop_at(S.count - 1);
+		tap_drop_at(S.count - 1, rl);
 }
 
-/* 鍵から取り口を作る。だめなら理由（アプリへ返す短い語）を返し、できたら NULL */
-static const char *tap_create(const char *key, uint64_t now)
+/* 鍵から取り口を作る。だめなら理由（アプリへ返す短い語）を返し、できたら NULL。
+ * input-<uuid> のソースは、呼ぶ側が S.mutex の前に引いて *src_io で渡す。取り口が
+ * 参照を持っていったら *src_io を NULL にする。残ったぶんは呼ぶ側がロックの外で返す */
+static const char *tap_create(const char *key, uint64_t now, obs_source_t **src_io)
 {
 	if (S.count >= MAX_TAPS)
 		return "full";
@@ -273,7 +311,7 @@ static const char *tap_create(const char *key, uint64_t now)
 		t->audio = audio;
 		obs_add_raw_audio_callback(t->mix_idx, NULL, on_track_audio, t);
 	} else if (strncmp(key, "input-", 6) == 0) {
-		obs_source_t *src = obs_get_source_by_uuid(key + 6);
+		obs_source_t *src = *src_io;
 		if (!src) {
 			pthread_mutex_destroy(&t->ring_mutex);
 			bfree(t);
@@ -283,13 +321,13 @@ static const char *tap_create(const char *key, uint64_t now)
 		 * もう音は来ないので受けない */
 		if (obs_source_removed(src) || obs_source_get_type(src) != OBS_SOURCE_TYPE_INPUT ||
 		    !(obs_source_get_output_flags(src) & OBS_SOURCE_AUDIO)) {
-			obs_source_release(src);
 			pthread_mutex_destroy(&t->ring_mutex);
 			bfree(t);
 			return "not_audio";
 		}
 		t->kind = TAP_INPUT;
-		t->source = src; /* 参照は持ったまま。tap_destroy で返す */
+		t->source = src; /* 参照は持ったまま。tap_destroy で手放す */
+		*src_io = NULL;
 		obs_source_add_audio_capture_callback(src, on_source_audio, t);
 	} else {
 		pthread_mutex_destroy(&t->ring_mutex);
@@ -302,7 +340,9 @@ static const char *tap_create(const char *key, uint64_t now)
 }
 
 /* ソースが消された（削除・シーンコレクションの切り替え）。参照を持っている
- * ので壊れはしないが、もう音は来ないので次の tick で畳む */
+ * ので壊れはしないが、もう音は来ないので次の tick で畳む。
+ * OBS はソース一覧のロックを持ったままここを呼ぶことがある。S.mutex を持つ側は
+ * 一覧のロックを待たない作りなので、ここで S.mutex を待っても固まらない */
 static void on_source_remove(void *data, calldata_t *cd)
 {
 	UNUSED_PARAMETER(data);
@@ -363,6 +403,7 @@ static void tick(void)
 	const uint64_t now = os_gettime_ns();
 	obs_data_array_t *taps = NULL;
 	struct dstr csv = {0};
+	struct release_list rl = {0};
 
 	pthread_mutex_lock(&S.mutex);
 	refresh_audio();
@@ -370,7 +411,7 @@ static void tick(void)
 	for (size_t i = 0; i < S.count;) {
 		struct tap *t = S.taps[i];
 		if (t->removed || now > t->lease_until_ns) {
-			tap_drop_at(i);
+			tap_drop_at(i, &rl);
 			continue;
 		}
 		i++;
@@ -407,6 +448,8 @@ static void tick(void)
 		obs_data_release(item);
 	}
 	pthread_mutex_unlock(&S.mutex);
+	/* 最後の参照ならここでソースの破棄が走る。ロックの外で */
+	release_flush(&rl);
 	dstr_free(&csv);
 
 	if (!taps)
@@ -494,6 +537,17 @@ static void req_subscribe(obs_data_t *req, obs_data_t *res, void *priv)
 	obs_data_array_t *rejected = obs_data_array_create();
 	const uint64_t now = os_gettime_ns();
 
+	/* uuid の引き当てはソース一覧のロックを取るので、S.mutex の前に済ませる。
+	 * 取り口がもうあって使わなかったぶんは、外してからまとめて返す */
+	obs_source_t **srcs = n ? bzalloc(n * sizeof(*srcs)) : NULL;
+	for (size_t i = 0; i < n; i++) {
+		obs_data_t *item = obs_data_array_item(keys, i);
+		const char *key = obs_data_get_string(item, "key");
+		if (key && strlen(key) < KEY_MAX && strncmp(key, "input-", 6) == 0)
+			srcs[i] = obs_get_source_by_uuid(key + 6);
+		obs_data_release(item);
+	}
+
 	pthread_mutex_lock(&S.mutex);
 	for (size_t i = 0; i < n; i++) {
 		obs_data_t *item = obs_data_array_item(keys, i);
@@ -511,12 +565,16 @@ static void req_subscribe(obs_data_t *req, obs_data_t *res, void *priv)
 			else
 				t->lease_until_ns = now + MS_TO_NS(LEASE_MS);
 		} else {
-			reason = tap_create(key, now);
+			reason = tap_create(key, now, &srcs[i]);
 		}
 		push_key(reason ? rejected : active, key, reason);
 		obs_data_release(item);
 	}
 	pthread_mutex_unlock(&S.mutex);
+
+	for (size_t i = 0; i < n; i++)
+		obs_source_release(srcs[i]);
+	bfree(srcs);
 
 	obs_data_set_array(res, "active", active);
 	obs_data_set_array(res, "rejected", rejected);
@@ -532,6 +590,7 @@ static void req_unsubscribe(obs_data_t *req, obs_data_t *res, void *priv)
 	UNUSED_PARAMETER(priv);
 	obs_data_array_t *keys = NULL;
 	const size_t n = req_key_count(req, &keys);
+	struct release_list rl = {0};
 
 	pthread_mutex_lock(&S.mutex);
 	for (size_t i = 0; i < n; i++) {
@@ -539,13 +598,14 @@ static void req_unsubscribe(obs_data_t *req, obs_data_t *res, void *priv)
 		const char *key = obs_data_get_string(item, "key");
 		for (size_t j = 0; key && j < S.count; j++) {
 			if (strcmp(S.taps[j]->key, key) == 0) {
-				tap_drop_at(j);
+				tap_drop_at(j, &rl);
 				break;
 			}
 		}
 		obs_data_release(item);
 	}
 	pthread_mutex_unlock(&S.mutex);
+	release_flush(&rl);
 
 	if (keys)
 		obs_data_array_release(keys);
@@ -597,12 +657,14 @@ void spectrum_shutdown(void)
 	if (S.enabled)
 		signal_handler_disconnect(obs_get_signal_handler(), "source_remove", on_source_remove, NULL);
 
+	struct release_list rl = {0};
 	pthread_mutex_lock(&S.mutex);
-	tap_drop_all();
+	tap_drop_all(&rl);
 	if (S.analyzer_ready) {
 		spectrum_analyzer_free(&S.analyzer);
 		S.analyzer_ready = false;
 	}
 	pthread_mutex_unlock(&S.mutex);
+	release_flush(&rl);
 	pthread_mutex_destroy(&S.mutex);
 }

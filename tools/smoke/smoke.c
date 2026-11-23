@@ -24,7 +24,13 @@
  * per-destination entry), and run from one color source to others to see the cut
  * happen at the destination's point while OBS's duration drives the time. obs-browser
  * is not loaded, so the overlay page itself is not drawn here; the event detail it
- * would receive is read back through the stinger's "stinger_last_event" proc. */
+ * would receive is read back through the stinger's "stinger_last_event" proc.
+ *
+ * Program frames (src/program-frames.c) run on the real graphics thread that
+ * obs_reset_video starts: the test subscribes through the vendor request, waits for
+ * frame_get to hand back a JPEG (FF D8 .. FF D9), puts a color source on the output
+ * to see the picture change, and checks a private vertical canvas, busy / no_canvas,
+ * unsubscribe and the lease. */
 #include <obs.h>
 #include <util/platform.h>
 #include <math.h>
@@ -41,7 +47,7 @@ static int failures = 0;
 #define EXPECTED_VENDOR_REQS 6
 #else
 #define EXPECTED_HOST "obs"
-#define EXPECTED_VENDOR_REQS 7
+#define EXPECTED_VENDOR_REQS 10
 #endif
 
 static void log_handler(int lvl, const char *msg, va_list args, void *p)
@@ -454,7 +460,7 @@ static obs_data_t *keys_request(const char *k1, const char *k2, const char *k3)
 static void test_spectrum(void)
 {
 	printf("== audio spectrum\n");
-	/* host_info 1 + spectrum 3 + meters 2 (+ stinger 1。Streamlabs では登録しない) */
+	/* host_info 1 + spectrum 3 + meters 2 (+ stinger 1 + frames 3。Streamlabs では登録しない) */
 	if (vendor_req_count != EXPECTED_VENDOR_REQS) {
 		printf("NG  expected %d vendor requests, got %zu\n", EXPECTED_VENDOR_REQS, vendor_req_count);
 		failures++;
@@ -929,6 +935,225 @@ static void test_stinger_monitor(void)
 	obs_source_release(tr);
 }
 
+/* ---- program frames (src/program-frames.c) ---- */
+#ifndef SMOKE_STREAMLABS
+static obs_data_t *frame_req(const char *canvas, long long width, long long since)
+{
+	obs_data_t *d = obs_data_create();
+	if (canvas)
+		obs_data_set_string(d, "canvas", canvas);
+	if (width >= 0)
+		obs_data_set_int(d, "width", width);
+	if (since >= 0)
+		obs_data_set_int(d, "since", since);
+	return d;
+}
+
+static obs_data_t *frame_call(const char *type, const char *canvas, long long width, long long since)
+{
+	obs_data_t *req = frame_req(canvas, width, since);
+	obs_data_t *res = vendor_call(type, req);
+	obs_data_release(req);
+	return res;
+}
+
+static int b64_val(char c)
+{
+	if (c >= 'A' && c <= 'Z')
+		return c - 'A';
+	if (c >= 'a' && c <= 'z')
+		return c - 'a' + 26;
+	if (c >= '0' && c <= '9')
+		return c - '0' + 52;
+	if (c == '+')
+		return 62;
+	if (c == '/')
+		return 63;
+	return -1;
+}
+
+/* base64 を戻す。戻した長さ（だめなら 0）。out は bfree */
+static size_t b64_decode(const char *in, uint8_t **out)
+{
+	const size_t n = strlen(in);
+	*out = NULL;
+	if (n == 0 || n % 4 != 0)
+		return 0;
+	uint8_t *buf = bmalloc(n / 4 * 3);
+	size_t len = 0;
+	for (size_t i = 0; i < n; i += 4) {
+		int v[4];
+		for (int k = 0; k < 4; k++)
+			v[k] = in[i + k] == '=' ? 0 : b64_val(in[i + k]);
+		if (v[0] < 0 || v[1] < 0 || v[2] < 0 || v[3] < 0) {
+			bfree(buf);
+			return 0;
+		}
+		const uint32_t x = ((uint32_t)v[0] << 18) | ((uint32_t)v[1] << 12) | ((uint32_t)v[2] << 6) | (uint32_t)v[3];
+		buf[len++] = (uint8_t)(x >> 16);
+		if (in[i + 2] != '=')
+			buf[len++] = (uint8_t)(x >> 8);
+		if (in[i + 3] != '=')
+			buf[len++] = (uint8_t)x;
+	}
+	*out = buf;
+	return len;
+}
+
+/* seq が since より新しい 1 枚が来るまで待つ。来たら JPEG の長さ（来なければ 0） */
+static size_t frame_wait(const char *canvas, long long since, long long *seq_out, uint32_t *w, uint32_t *h)
+{
+	for (int i = 0; i < 100; i++) {
+		obs_data_t *res = frame_call("frame_get", canvas, -1, since);
+		const long long seq = obs_data_get_int(res, "seq");
+		const char *b64 = obs_data_get_string(res, "jpeg");
+		if (seq > since && b64 && *b64) {
+			uint8_t *jpg = NULL;
+			const size_t len = b64_decode(b64, &jpg);
+			const bool soi = len > 4 && jpg[0] == 0xFF && jpg[1] == 0xD8;
+			const bool eoi = len > 4 && jpg[len - 2] == 0xFF && jpg[len - 1] == 0xD9;
+			*seq_out = seq;
+			*w = (uint32_t)obs_data_get_int(res, "width");
+			*h = (uint32_t)obs_data_get_int(res, "height");
+			bfree(jpg);
+			obs_data_release(res);
+			return soi && eoi ? len : 0;
+		}
+		obs_data_release(res);
+		os_sleep_ms(20);
+	}
+	return 0;
+}
+
+static void test_frames(void)
+{
+	printf("== program frames\n");
+
+	obs_data_t *res = frame_call("frame_get", NULL, -1, -1);
+	check(!obs_data_get_bool(res, "active") && obs_data_get_int(res, "seq") == 0 &&
+		      obs_data_get_int(res, "width") == 0,
+	      "frames: frame_get before subscribe is inactive");
+	obs_data_release(res);
+
+	/* 幅は 160..1280、偶数。高さは 16:9 から */
+	res = frame_call("frame_subscribe", NULL, 100, -1);
+	check(obs_data_get_bool(res, "active") && obs_data_get_int(res, "width") == 160 &&
+		      obs_data_get_int(res, "height") == 90,
+	      "frames: width clamps to 160 (160x90)");
+	obs_data_release(res);
+	res = frame_call("frame_subscribe", "", 333, -1);
+	printf("    subscribe 333 -> %lldx%lld\n", obs_data_get_int(res, "width"), obs_data_get_int(res, "height"));
+	check(obs_data_get_bool(res, "active") && obs_data_get_int(res, "width") == 332 &&
+		      obs_data_get_int(res, "height") == 186,
+	      "frames: re-subscribe resizes (332x186, even)");
+	obs_data_release(res);
+
+	/* 出力に何も無い（黒）1 枚 */
+	long long seq = 0;
+	uint32_t w = 0, h = 0;
+	const size_t black_len = frame_wait(NULL, 0, &seq, &w, &h);
+	printf("    black frame: seq=%lld %ux%u jpeg=%zu bytes\n", seq, w, h, black_len);
+	check(black_len > 0 && seq >= 1 && w == 332 && h == 186, "frames: frame_get returns a JPEG (FF D8 .. FF D9)");
+
+	res = frame_call("frame_get", NULL, -1, seq + 1000);
+	check(obs_data_get_bool(res, "active") && !obs_data_has_user_value(res, "jpeg"),
+	      "frames: no jpeg when nothing newer than since");
+	obs_data_release(res);
+
+	/* 出力に色のソースを置くと、絵が変わる（黒の JPEG より重くなる） */
+	obs_source_t *src = obs_source_create_private("smoke_color", "frames color", NULL);
+	obs_set_output_source(0, src);
+	os_sleep_ms(300);
+	long long seq2 = 0;
+	const size_t color_len = frame_wait(NULL, seq, &seq2, &w, &h);
+	printf("    color frame: seq=%lld jpeg=%zu bytes\n", seq2, color_len);
+	check(color_len > black_len + 100, "frames: the program output reaches the JPEG");
+
+	/* 30fps を超えて取らず、描画の揺れで 1 枚おきにも落ちない（smoke の描画は 30fps） */
+	{
+		obs_data_t *a = frame_call("frame_get", NULL, -1, -1);
+		const long long s0 = obs_data_get_int(a, "seq");
+		obs_data_release(a);
+		for (int i = 0; i < 4; i++) {
+			obs_data_release(frame_call("frame_subscribe", NULL, 333, -1));
+			os_sleep_ms(250);
+		}
+		a = frame_call("frame_get", NULL, -1, -1);
+		const long long s1 = obs_data_get_int(a, "seq");
+		obs_data_release(a);
+		printf("    frames in 1s: %lld\n", s1 - s0);
+		check(s1 - s0 >= 24 && s1 - s0 <= 32, "frames: about 30 frames per second");
+	}
+
+	/* 縦のキャンバス */
+	struct obs_video_info vovi = {0};
+	obs_get_video_info(&vovi);
+	vovi.base_width = 1080;
+	vovi.base_height = 1920;
+	vovi.output_width = 1080;
+	vovi.output_height = 1920;
+	obs_canvas_t *vertical = obs_canvas_create_private("smoke vertical", &vovi, 0);
+	check(vertical != NULL, "frames: created a vertical canvas");
+	if (vertical) {
+		obs_canvas_set_channel(vertical, 0, src);
+		const char *vuuid = obs_canvas_get_uuid(vertical);
+		res = frame_call("frame_subscribe", vuuid, 270, -1);
+		printf("    vertical subscribe -> active=%d %lldx%lld reason=%s\n", obs_data_get_bool(res, "active"),
+		       obs_data_get_int(res, "width"), obs_data_get_int(res, "height"),
+		       obs_data_get_string(res, "reason"));
+		check(obs_data_get_bool(res, "active") && obs_data_get_int(res, "width") == 270 &&
+			      obs_data_get_int(res, "height") == 480,
+		      "frames: vertical canvas subscribes (270x480)");
+		obs_data_release(res);
+		long long vseq = 0;
+		const size_t vlen = frame_wait(vuuid, 0, &vseq, &w, &h);
+		printf("    vertical frame: seq=%lld %ux%u jpeg=%zu bytes\n", vseq, w, h, vlen);
+		check(vlen > 0 && w == 270 && h == 480, "frames: vertical canvas returns a JPEG");
+
+		/* 3 つ目は busy（メインのキャンバスを uuid で名指しすると、鍵は "" と別になる） */
+		obs_canvas_t *main_canvas = obs_get_main_canvas();
+		res = frame_call("frame_subscribe", obs_canvas_get_uuid(main_canvas), 320, -1);
+		check(!obs_data_get_bool(res, "active") && strcmp(obs_data_get_string(res, "reason"), "busy") == 0,
+		      "frames: third subscription is busy");
+		obs_data_release(res);
+		obs_canvas_release(main_canvas);
+	}
+
+	res = frame_call("frame_subscribe", "00000000-0000-0000-0000-000000000000", 320, -1);
+	check(!obs_data_get_bool(res, "active") && strcmp(obs_data_get_string(res, "reason"), "no_canvas") == 0,
+	      "frames: unknown canvas is no_canvas");
+	obs_data_release(res);
+
+	/* 外すとすぐ止まる */
+	obs_data_release(frame_call("frame_unsubscribe", NULL, -1, -1));
+	res = frame_call("frame_get", NULL, -1, -1);
+	check(!obs_data_get_bool(res, "active") && obs_data_get_int(res, "seq") == 0,
+	      "frames: unsubscribe stops the main canvas");
+	obs_data_release(res);
+
+	/* 呼び直さないと期限（6 秒）で畳まれる */
+	if (vertical) {
+		const char *vuuid = obs_canvas_get_uuid(vertical);
+		os_sleep_ms(6700);
+		res = frame_call("frame_get", vuuid, -1, -1);
+		check(!obs_data_get_bool(res, "active"), "frames: lease expires after 6 s");
+		obs_data_release(res);
+		/* 畳まれたら同じキャンバスでまた取れる（枠が空いている） */
+		res = frame_call("frame_subscribe", vuuid, 270, -1);
+		check(obs_data_get_bool(res, "active"), "frames: subscribe again after expiry");
+		obs_data_release(res);
+		obs_data_release(frame_call("frame_unsubscribe", vuuid, -1, -1));
+
+		obs_canvas_set_channel(vertical, 0, NULL);
+		obs_canvas_remove(vertical);
+		obs_canvas_release(vertical);
+	}
+
+	obs_set_output_source(0, NULL);
+	obs_source_release(src);
+}
+#endif
+
 /* どこに読み込まれたかと、使えるものの一覧（アプリがつないで最初に聞く） */
 static void test_host_info(void)
 {
@@ -944,6 +1169,14 @@ static void test_host_info(void)
 #else
 	check(stinger, "host_info: stinger on OBS");
 #endif
+	{
+		const bool frames = features && obs_data_get_bool(features, "frames");
+#ifdef SMOKE_STREAMLABS
+		check(!frames, "host_info: no frames on Streamlabs");
+#else
+		check(frames, "host_info: frames on OBS");
+#endif
+	}
 	check(features && obs_data_get_bool(features, "meters") && obs_data_get_bool(features, "spectrum"),
 	      "host_info: meters and spectrum");
 	if (features)
@@ -1407,6 +1640,7 @@ int main(int argc, char **argv)
 #else
 	test_stinger();
 	test_stinger_monitor();
+	test_frames();
 #endif
 
 	obs_shutdown();

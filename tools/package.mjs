@@ -98,6 +98,7 @@ writeFileSync(
     "OBS Studio plugin used by StreamSpook (post effects etc.).",
     "Licensed under the GNU General Public License v2.0 or later; see LICENSE.",
     "Source code: https://github.com/Fortyworks/stream-spook-obs-plugin",
+    "Includes stb_image_write by Sean Barrett (public domain / MIT).",
     "",
     "Install: put this folder at %ProgramData%\\obs-studio\\plugins\\stream-spook and restart OBS.",
     "",

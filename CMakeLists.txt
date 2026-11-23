@@ -42,6 +42,7 @@ target_sources(
     src/host.c
     src/meters.c
     src/pipe.c
+    src/program-frames.c
     src/film-filter.c
     src/mosaic-filter.c
     src/vignette-filter.c
@@ -54,6 +55,7 @@ target_sources(
     src/spectrum.c
     src/stinger-transition.c
     src/vendor.c
+    src/third_party/stb_image_write.c
 )
 
 # 帯の計算だけを libobs 無しで確かめる（tools/smoke/analyzer-test.c）。
